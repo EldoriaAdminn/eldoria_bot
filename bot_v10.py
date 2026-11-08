@@ -51,8 +51,8 @@ DB_PATH = os.getenv("DB_PATH", "game.db")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 # ======================= تنظیمات بازی (همه قابل تغییر) =======================
-WORK_COOLDOWN = 300
-ADVENTURE_COOLDOWN = 900
+WORK_COOLDOWN = 180          # پایه ۳ دقیقه (قبلاً ۵) — برای لول پایین کمتر هم می‌شه
+ADVENTURE_COOLDOWN = 600     # پایه ۱۰ دقیقه (قبلاً ۱۵)
 DAILY_COOLDOWN = 20 * 3600
 ROB_COOLDOWN = 1800
 DUEL_COOLDOWN = 600
@@ -63,9 +63,9 @@ CHAT_REWARD = 1
 CHAT_COOLDOWN = 90
 CHAT_DAILY_CAP = 30
 
-POINT_BASE = 420
-POINT_STEP = 30
-POINT_MIN = 180
+POINT_BASE = 300             # پوینت زودتر آماده می‌شه
+POINT_STEP = 25
+POINT_MIN = 90
 MAX_CITY = 12
 
 BANK_RATE = 0.002
@@ -311,28 +311,59 @@ INVITE_MILESTONES = {3: "amb1", 10: "amb2"}
 
 # ---------- متن‌های رنگارنگ ----------
 WORK_STORIES = {
-    "": ["📦 توی بازار شهر بار حمل کردی و تاجرها کلی انعام دادن!",
-         "🌾 مزرعه‌ی ارباب رو شخم زدی و عرق ریختی!",
-         "🔥 تو کارگاه آهنگری چکش زدی و شمشیر ساختی!",
-         "🏗 دیوار قلعه رو با بقیه تعمیر کردی!",
-         "🐎 اسب‌های اصطبل سلطنتی رو شستی و براق کردی!"],
-    "کارگر": ["🏗 ساعت‌ها آجر جابه‌جا کردی و برج تازه‌ای بالا رفت!", "🪵 چوب‌های جنگل رو بریدی و به کارگاه رسوندی!"],
-    "معدنچی": ["⛏ تو عمق معدن یه رگه‌ی درخشان طلا پیدا کردی!", "💎 بین سنگ‌ها یه تیکه سنگ قیمتی کشف کردی!"],
-    "نگهبان": ["🛡 تا صبح دروازه‌ی شهر رو نگهبانی دادی و هیچ دزدی رد نشد!", "🗼 از برج دیده‌بانی یه گروه مشکوک رو لو دادی!"],
-    "تاجر": ["💰 یه معامله‌ی پرسود بستی و کیسه‌ت سنگین شد!", "🐪 کاروان ادویه رو سالم به مقصد رسوندی!"],
-    "راهزن": ["🏴‍☠️ یه کاروان بی‌دفاع رو غافلگیر کردی!", "🌙 نصف شب از انبار یه تاجر ثروتمند رد شدی!"],
+    "": [
+        "📦 توی بازار بار جا‌به‌جا کردی و تاجرها انعام حسابی دادن!",
+        "🌾 مزرعه رو شخم زدی؛ عرق ریختی ولی جیب‌ت پر شد!",
+        "🔥 تو کارگاه آهنگری چکش زدی و یه شمشیر تموم کردی!",
+        "🏗 دیوار قلعه رو با بقیه تعمیر کردی؛ فرمانده راضی بود!",
+        "🐎 اسب‌های سلطنتی رو شستی و برق انداختی!",
+        "🪵 هیزم جنگل رو رسوندی به شهر؛ مردم دستت رو بوسیدن!",
+        "🧹 حیاط قصر رو تمیز کردی و یه سکه طلا پیدا کردی!",
+    ],
+    "کارگر": [
+        "🏗 آجرها رو بالا بردی و برج تازه قد کشید!",
+        "🪵 چوب‌های جنگل رو بریدی و کارگاه پر از کار شد!",
+        "🧱 دیوار شکسته رو بازسازی کردی؛ شهر امن‌تر شد!",
+    ],
+    "معدنچی": [
+        "⛏ تو عمق معدن یه رگه‌ی طلا پیدا کردی!",
+        "💎 بین سنگ‌ها یه سنگ قیمتی درخشان کشف کردی!",
+        "🪨 تونل جدید باز کردی و گنج قدیمی از خاک دراومد!",
+    ],
+    "نگهبان": [
+        "🛡 تا صبح دروازه رو نگهبانی دادی؛ هیچ دزدی رد نشد!",
+        "🗼 از برج دیده‌بانی گروه مشکوک رو لو دادی!",
+        "⚔️ یه زد و خورد کوچیک رو آروم کردی؛ مردم تشکر کردن!",
+    ],
+    "تاجر": [
+        "💰 معامله‌ی پرسود بستی و کیسه‌ت سنگین شد!",
+        "🐪 کاروان ادویه رو سالم رسوندی به مقصد!",
+        "📜 قرارداد بزرگ بستی؛ سودش توی جیبته!",
+    ],
+    "راهزن": [
+        "🏴‍☠️ کاروان بی‌دفاع رو غافلگیر کردی!",
+        "🌙 نصف شب از انبار تاجر ثروتمند رد شدی!",
+        "🗡 کمین زدی و غنیمت خوبی جمع کردی!",
+    ],
 }
-ADV_WIN = ["🐉 اژدهای آتشین رو شکست دادی و روی گنجش نشستی!",
-           "💎 یه غار پر از جواهر پیدا کردی!",
-           "🏴‍☠️ گنج دزدان دریایی رو کشف کردی!",
-           "🗝 صندوق گمشده‌ی پادشاه قدیمی رو باز کردی!",
-           "🧙 جادوگر پیر ازت راضی شد و پاداش داد!",
-           "🏰 قلعه‌ی ارواح رو تسخیر کردی!"]
-ADV_LOSE = ["☠️ تو جنگل تاریک گم شدی و دزدها گیرت انداختن!",
-            "🐺 گرگ‌های وحشی بهت حمله کردن و فرار کردی!",
-            "🌋 تو غار آتشفشانی غافلگیر شدی!",
-            "🕸 عنکبوت‌های غول‌پیکر تو تار گیرت انداختن!",
-            "👻 روح‌های سرگردان ازت باج گرفتن!"]
+ADV_WIN = [
+    "🐉 اژدهای آتشین رو شکست دادی و روی گنجش نشستی!",
+    "💎 غار پر از جواهر پیدا کردی؛ چشات برق زد!",
+    "🏴‍☠️ گنج دزدان دریایی رو از ته دریا دراوردی!",
+    "🗝 صندوق گمشده‌ی پادشاه قدیمی رو باز کردی!",
+    "🧙 جادوگر پیر ازت خوشش اومد و پاداش داد!",
+    "🏰 قلعه‌ی ارواح رو تسخیر کردی؛ حالا مال توئه!",
+    "🐺 رئیس گرگ‌ها رو شکست دادی و قلمروشون مال تو شد!",
+    "⚔️ جنگجوی افسانه‌ای رو تو دوئل بردی و شمشیرش رو گرفتی!",
+]
+ADV_LOSE = [
+    "☠️ تو جنگل گم شدی و دزدها جیب‌ت رو خالی کردن!",
+    "🐺 گرگ‌ها حمله کردن؛ با زحمت فرار کردی!",
+    "🌋 غار آتشفشانی غافلگیرت کرد؛ یه کم سوخت شدی!",
+    "🕸 عنکبوت‌های غول‌پیکر گیرت انداختن!",
+    "👻 روح‌ها ازت باج گرفتن و رفتن!",
+    "💨 تله‌ی قدیمی فعال شد و مجبور به عقب‌نشینی شدی!",
+]
 LOVE_LINES = ["💞 {a} برای {b} یه دسته گل رز چید 🌹 و {b} از خوشحالی پرواز کرد!",
               "🥰 {a} و {b} زیر نور ماه قدم زدن و دل‌هاشون رو بهم دادن 🌙",
               "💌 {a} یه نامه‌ی عاشقانه برای {b} نوشت و قلب {b} لرزید!",
@@ -384,7 +415,7 @@ db.execute("PRAGMA journal_mode=WAL")
 db.execute("PRAGMA busy_timeout=5000")
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(
-    id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', coins INTEGER NOT NULL DEFAULT 100);
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', coins INTEGER NOT NULL DEFAULT 500);
 CREATE TABLE IF NOT EXISTS items(
     user_id INTEGER, item TEXT, qty INTEGER DEFAULT 0, PRIMARY KEY(user_id, item));
 CREATE TABLE IF NOT EXISTS cities(chat_id INTEGER PRIMARY KEY, level INTEGER DEFAULT 0);
@@ -719,6 +750,15 @@ def bar(cur, total, n=10):
 
 def cd_left(u, col, seconds):
     return u[col] + seconds - time.time()
+
+
+def work_cd(lvl):
+    """لول پایین سریع‌تر کار کنه تا حوصله‌ش سر نره."""
+    return max(60, WORK_COOLDOWN - (lvl - 1) * 12)
+
+
+def adv_cd(lvl):
+    return max(240, ADVENTURE_COOLDOWN - (lvl - 1) * 20)
 
 
 def set_time(uid, col):
@@ -1150,7 +1190,9 @@ def create_character(uid, gender, cls, name):
             return False
         db.execute("UPDATE users SET gender=?, cls=?, created=?, name=? WHERE id=?",
                    (gender, cls, time.time(), name, uid))
-        if u["referred_by"]:   # با لینک دعوت یه دوست اومده: هدیه‌ی خوش‌آمد، و به دوستش خبر می‌دیم
+        # پک شروع برای حس خوب اول
+        add_coins(uid, 400)
+        if u["referred_by"]:
             add_coins(uid, REF_WELCOME)
             give_item(uid, "egg1")
             notify(u["referred_by"], f"🤝 {name} با لینک دعوت تو شخصیت ساخت!\n"
@@ -1159,21 +1201,21 @@ def create_character(uid, gender, cls, name):
 
 
 def created_text(u):
-    return (f"🎉 شخصیتت ساخته شد!\n━━━━━━━━━━━━━━\n"
-            f"👤 {u['name']}  {GENDERS[u['gender']]}\n"
+    return (f"🎉🥳 به سرزمین خوش اومدی!\n━━━━━━━━━━━━━━\n"
+            f"👤 {u['name']}   {GENDERS[u['gender']]}\n"
             f"🎭 {CLASSES[u['cls']][0]}\n✨ {CLASSES[u['cls']][1]}\n"
             "━━━━━━━━━━━━━━\n"
-            "⭐ لول ۱ شدی!\n\n"
-            "🔥 چطور پول و XP دربیاری؟\n"
-            "• «کار» → سکه + XP (هر ۵ دقیقه)\n"
-            "• «پوینت» → سکه رایگان\n"
-            "• از لول ۲: «ماجراجویی» و «جایزه» روزانه\n\n"
-            "🚀 قدم بعدی:\n"
-            "۱. برو توی گروه بازی\n"
-            "۲. بنویس «آموزش» (جایزه‌های شروع)\n"
-            "۳. «فروشگاه» رو ببین و تجهیزات کلاس خودت رو بخر\n\n"
-            "💡 کلاس تو وسایل مخصوص خودش رو داره — جادوگر عصا می‌گیره، جنگجو شمشیر!\n"
-            "🔒 بازی فقط داخل گروه فعال هست.")
+            "⭐ لول ۱ شدی — ماجراجویی شروع شد!\n\n"
+            "🔥 همین الان این کارها رو بکن:\n"
+            "1️⃣ برو توی گروه و بنویس «کار»\n"
+            "2️⃣ بنویس «پوینت» (سکه رایگان)\n"
+            "3️⃣ بنویس «آموزش» و جایزه‌های شروع رو بگیر\n\n"
+            "💰 کار کن → سکه و XP دربیار\n"
+            "🛒 فروشگاه → تجهیزات کلاس خودت رو بخر\n"
+            "🐉 از لول ۲ ماجراجویی و غول باز می‌شه\n\n"
+            "💡 هر کلاس سلاح خودش رو داره:\n"
+            "جنگجو شمشیر · جادوگر عصا · شکارچی کمان\n\n"
+            "🚀 الان برو گروه و اولین «کار»ت رو بزن!")
 
 
 @command("start", "شروع")
@@ -1351,11 +1393,11 @@ async def cmd_profile(update, ctx, args):
 @command("کار", "work")
 async def cmd_work(update, ctx, args):
     u = get_user(update.effective_user)
-    uid = u["id"]
-    left = cd_left(u, "last_work", WORK_COOLDOWN)
+    uid, lvl = u["id"], level_of(u["xp"])
+    left = cd_left(u, "last_work", work_cd(lvl))
     if left > 0:
-        return await update.message.reply_text(f"⏳ {fmt_time(left)} دیگه می‌تونی کار کنی.")
-    gain = (random.randint(8, 14) + level_of(u["xp"]) + best_power(uid, "tool")
+        return await update.message.reply_text(f"⏳ {fmt_time(left)} دیگه آماده‌ای برای کار.")
+    gain = (random.randint(10, 16) + lvl + best_power(uid, "tool")
             + JOB_WORK.get(u["job"], 0) + (2 if u["cls"] == "hunter" else 0))
     bonus = guild_bonus(uid)
     gain = int(gain * (1 + bonus / 100))
@@ -1365,28 +1407,29 @@ async def cmd_work(update, ctx, args):
     married = spouse_of(uid) is not None
     if married:
         gain = int(gain * (1 + MARRY_BONUS / 100))
+    # لول پایین کمی سکه بیشتر بگیره تا حس پیشرفت قوی‌تر باشه
+    if lvl <= 5:
+        gain = int(gain * 1.15)
     with tx():
         db.execute("UPDATE users SET coins=coins+?, last_work=?, work_count=work_count+1 WHERE id=?",
                    (gain, time.time(), uid))
         bump(uid, "work")
-        xp, note = grant_xp(uid, 6)
+        xp, note = grant_xp(uid, 8 if lvl <= 5 else 6)
     perks = []
     if bonus:
-        perks.append(f"🏰 انجمن +{bonus}٪")
+        perks.append(f"🏰 +{bonus}٪")
     if married:
-        perks.append(f"💍 همسر +{MARRY_BONUS}٪")
+        perks.append(f"💍 +{MARRY_BONUS}٪")
     if pet_c:
-        perks.append(f"🐾 همراه +{pet_c:.0f}٪")
+        perks.append(f"🐾 +{pet_c:.0f}٪")
     if fal_c:
-        perks.append(f"🔮 فال +{fal_c:.0f}٪")
+        perks.append(f"🔮 +{fal_c:.0f}٪")
     if ev_mult > 1:
         perks.append(f"{ev_label} ×{ev_mult:g}")
-    if season_perk("work_coins") > 1:
-        perks.append(f"{season_theme(season_now()['no'])[0]} مزیت فصل +{int(round((season_perk('work_coins') - 1) * 100))}٪")
     story = random.choice(WORK_STORIES.get(u["job"], WORK_STORIES[""]))
-    text = f"{story}\n━━━━━━━━━━━━━━\n💰 +{gain:,} سکه\n✨ +{xp} XP"
+    text = f"{story}\n━━━━━━━━━━━━━━\n💰 +{gain:,} سکه   ✨ +{xp} XP"
     if perks:
-        text += "\n" + "  ".join(perks)
+        text += "\n" + " · ".join(perks)
     chat_score(update.effective_chat.id, 2)
     await reply_game(update, ctx, text + note, "work")
 
@@ -1424,7 +1467,9 @@ async def cmd_point(update, ctx, args):
                    (uid, chat_id, time.time()))
         bump(uid, "point")
         xp, note = grant_xp(uid, 4)
-    await reply_game(update, ctx, f"⭐ پوینت گرفتی!\n━━━━━━━━━━━━━━\n💰 +{gain} سکه\n✨ +{xp} XP" + note, "point", STICKER_CHANCE * 0.6)
+    await reply_game(update, ctx,
+                     f"⭐ پوینت آماده بود!\n━━━━━━━━━━━━━━\n💰 +{gain} سکه   ✨ +{xp} XP" + note,
+                     "point", STICKER_CHANCE * 0.4)
     chat_score(update.effective_chat.id, 1)
 
 
@@ -1432,7 +1477,7 @@ async def cmd_point(update, ctx, args):
 async def cmd_adventure(update, ctx, args):
     u = get_user(update.effective_user)
     uid, lvl = u["id"], level_of(u["xp"])
-    left = cd_left(u, "last_adv", ADVENTURE_COOLDOWN)
+    left = cd_left(u, "last_adv", adv_cd(lvl))
     if left > 0:
         return await update.message.reply_text(f"⏳ {fmt_time(left)} دیگه می‌تونی بری ماجراجویی.")
     chance = min(0.50 + best_power(uid, "weapon") / 100 + lvl * 0.005 + (pet_bonus(uid, "luck") + fal_bonus(uid, "luck")) / 100, 0.90)
@@ -1543,50 +1588,40 @@ def shop_main_view(uid):
     u = user_by_id(uid)
     cls_name = CLASSES.get(u["cls"], ("",))[0] if u else ""
     kb = [[Btn(label, f"shop:{uid}:{cat}")] for cat, label in CATEGORIES.items()]
-    text = (f"🏪 فروشگاه\n━━━━━━━━━━━━━━\n"
-            f"💰 سکه‌ات: {u['coins']:,}\n"
-            f"🎭 کلاس: {cls_name}\n\n"
-            "دسته مورد نظرت رو انتخاب کن:\n"
-            "💡 وسایل مخصوص کلاس خودت فقط برای تو نمایش داده می‌شه.")
+    text = f"🏪 فروشگاه  ·  💰 {u['coins']:,}  ·  {cls_name}"
     return text, Markup(kb)
 
 
 def shop_cat_view(cat, u):
+    """همه اطلاعات داخل دکمه‌هاست — متن بالا خیلی کوتاه."""
     uid, lvl, have = u["id"], level_of(u["xp"]), owned(u["id"])
-    lines = [
-        f"💰 سکه‌ات: {u['coins']:,}",
-        f"⭐ لول تو: {lvl}",
-        "",
-        f"{CATEGORIES[cat]}",
-        "━━━━━━━━━━━━━━",
-    ]
-    kb, hidden, shown = [], 0, 0
+    kb, hidden = [], 0
     for key, (name, c, _, minlvl, power, desc) in sorted(ITEMS.items(), key=lambda kv: (kv[1][3], kv[1][2])):
         if c != cat or key in HIDDEN_ITEMS:
             continue
         if not item_usable(u, key):
             hidden += 1
             continue
-        shown += 1
         price = item_price(u, key)
         tag = ITEM_RARITY.get(key, "")
-        owned_mark = "✅ " if key in have else ""
         req = req_label(key)
-        if lvl < minlvl:
-            # قفل‌شده — قیمت و اسم، با قفل واضح
-            lines.append(f"🔒 {tag}{name}{req} — {price:,} سکه (لول {minlvl})")
+        if key in have and cat != "misc":
+            label = f"✅ {tag}{name}{req}"
+            kb.append([Btn(label, f"buy:{uid}:{key}")])  # کلیک بی‌اثر یا پیام داری
+        elif lvl < minlvl:
+            label = f"🔒 {tag}{name} — {price:,} (لول {minlvl})"
+            kb.append([Btn(label, f"buy:{uid}:{key}")])
         else:
-            lines.append(f"{owned_mark}{tag}{name}{req} — {price:,} سکه")
-            if cat == "misc" or key not in have:
-                kb.append([Btn(f"خرید {name} • {price:,}", f"buy:{uid}:{key}")])
-    if shown == 0:
-        lines.append("هیچ وسیله‌ای برای کلاس/شغل تو در این دسته نیست.")
-    if hidden:
-        lines.append(f"\n🔐 {hidden} وسیله‌ی مخصوص کلاس یا شغل‌های دیگه مخفیه.")
-    if any(ITEM_RARITY.get(k) for k in ITEMS if ITEMS[k][1] == cat):
-        lines.append("\n🟦 نادر  🟪 حماسی  🟧 افسانه‌ای")
+            label = f"{tag}{name}{req} — {price:,}"
+            kb.append([Btn(label, f"buy:{uid}:{key}")])
+    if not kb:
+        text = f"{CATEGORIES[cat]}\n💰 {u['coins']:,}\n\nچیزی برای کلاس تو اینجا نیست."
+    else:
+        text = f"{CATEGORIES[cat]}  ·  💰 {u['coins']:,}"
+        if hidden:
+            text += f"\n🔐 {hidden} وسیله‌ی کلاس‌های دیگه مخفیه"
     kb.append([Btn("⬅️ برگشت", f"shop:{uid}:main")])
-    return "\n".join(lines), Markup(kb)
+    return text, Markup(kb)
 
 
 @command("فروشگاه", "shop")
