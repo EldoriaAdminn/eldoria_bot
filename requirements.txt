@@ -1,3 +1,2 @@
 python-telegram-bot[socks]==21.6
-python-telegram-bot[socks]==21.6
 Pillow
