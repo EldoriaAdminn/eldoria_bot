@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ربات بازی ماجراجویی تلگرام – نسخه‌ی یکپارچه (v10)
+ربات بازی ماجراجویی تلگرام – نسخه‌ی یکپارچه (v11.0)
 
 متغیرهای محیطی:
   BOT_TOKEN        توکن ربات (اجباری)
@@ -12,13 +12,16 @@
   AUTO_PROFILE     اگه 0 باشه ربات توضیحات و منوی دستورها رو تنظیم نمی‌کنه
   BOT_CHANNEL      آیدی/یوزرنیم کانال (مثل @mychannel) — توی توضیحات ربات و اجبار عضویت
   REQUIRED_CHANNEL یوزرنیم کانال اجباری (مثل @mychannel) — بدون عضویت بازی نمی‌شه
-  REQUIRED_GROUP   یوزرنیم یا لینک گروه اجباری (مثل @mygroup) — بدون عضویت بازی نمی‌شه
+  REQUIRED_GROUP   یوزرنیم گروه عمومی اجباری (مثل mygroup) — عضویت قابل بررسی است
+  REQUIRED_GROUP_INVITE لینک دعوت گروه خصوصی (صرفاً برای نمایش؛ عضویت آن قابل بررسی نیست)
 
 نکته‌ی مهم: برای اینکه ربات کلمه‌های فارسی بدون اسلش ("کار"، "پوینت"، ...) رو توی گروه ببینه،
 توی BotFather بزن /setprivacy و Privacy Mode رو Disable کن (یا ربات رو ادمین گروه کن).
 """
 import asyncio
 import html
+import json
+from io import BytesIO
 import logging
 import math
 import os
@@ -27,6 +30,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from urllib.parse import quote
 
 from telegram import InlineKeyboardButton as _InlineButton
 from telegram import InlineKeyboardMarkup as Markup
@@ -51,8 +55,8 @@ DB_PATH = os.getenv("DB_PATH", "game.db")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 # ======================= تنظیمات بازی (همه قابل تغییر) =======================
-WORK_COOLDOWN = 180          # پایه ۳ دقیقه (قبلاً ۵) — برای لول پایین کمتر هم می‌شه
-ADVENTURE_COOLDOWN = 600     # پایه ۱۰ دقیقه (قبلاً ۱۵)
+WORK_COOLDOWN = 300
+ADVENTURE_COOLDOWN = 900
 DAILY_COOLDOWN = 20 * 3600
 ROB_COOLDOWN = 1800
 DUEL_COOLDOWN = 600
@@ -63,9 +67,9 @@ CHAT_REWARD = 1
 CHAT_COOLDOWN = 90
 CHAT_DAILY_CAP = 30
 
-POINT_BASE = 300             # پوینت زودتر آماده می‌شه
-POINT_STEP = 25
-POINT_MIN = 90
+POINT_BASE = 420
+POINT_STEP = 30
+POINT_MIN = 180
 MAX_CITY = 12
 
 BANK_RATE = 0.002
@@ -142,7 +146,7 @@ except ValueError:
     STICKER_CHANCE = 0.06
 
 # کانال و گروه اجباری
-# کانال عمومی با یوزرنیم چک می‌شه؛ گروه خصوصی فقط لینک عضویت نشون داده می‌شه
+# کانال و گروه عمومی بررسی می‌شوند؛ لینک گروه خصوصی صرفاً نمایش داده می‌شود.
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "Eldoria_Adventure").strip().lstrip("@")
 REQUIRED_GROUP = os.getenv("REQUIRED_GROUP", "").strip().lstrip("@")  # یوزرنیم عمومی (اگر داشت)
 REQUIRED_GROUP_INVITE = os.getenv("REQUIRED_GROUP_INVITE", "https://t.me/+Gxj_L7yfpwE5ZjEx").strip()
@@ -231,8 +235,13 @@ ITEM_REQ = {}       # کلید -> ("cls", نام کلاس) یا ("job", نام �
 ITEM_RARITY = {}    # کلید -> 🟦 نادر / 🟪 حماسی / 🟧 افسانه‌ای
 
 
+RARITY = {1: ("⚪", "Common", "معمولی"), 2: ("🟩", "Uncommon", "غیرمعمول"), 3: ("🟦", "Rare", "کمیاب"),
+          4: ("🟪", "Epic", "حماسی"), 5: ("🟧", "Legendary", "افسانه‌ای")}
+TIER_OF = {v[0]: k for k, v in RARITY.items()}
+
+
 def _rarity(lvl):
-    return "🟧" if lvl >= 22 else "🟪" if lvl >= 14 else "🟦" if lvl >= 7 else ""
+    return "🟧" if lvl >= 22 else "🟪" if lvl >= 14 else "🟦" if lvl >= 7 else "🟩" if lvl >= 3 else "⚪"
 
 
 def _gear(key, name, cat, price, lvl, power, req):
@@ -240,8 +249,7 @@ def _gear(key, name, cat, price, lvl, power, req):
             "armor": f"{power}٪ کاهش خسارت", "charm": f"{power}٪ جایزه بیشتر"}[cat]
     ITEMS[key] = (name, cat, price, lvl, power, desc)
     ITEM_REQ[key] = req
-    if _rarity(lvl):
-        ITEM_RARITY[key] = _rarity(lvl)
+    ITEM_RARITY[key] = _rarity(lvl)
 
 
 _W = [(5, 6, 4500), (10, 13, 28000), (16, 21, 90000), (24, 30, 320000)]   # (لول، قدرت، قیمت)
@@ -309,61 +317,67 @@ ITEM_RARITY["world1"] = "🟧"
 HIDDEN_ITEMS = {"amb1", "amb2", "champ1", "champ2", "road1", "egg3", "world1"}
 INVITE_MILESTONES = {3: "amb1", 10: "amb2"}
 
+# ---------- غنیمت‌های ویژه‌ی مناطق ماجراجویی و سرداب (غیرقابل‌خرید و غیرقابل‌معامله) ----------
+ITEMS["rel1"] = ("🍃 تعویذ جنگل زمزمه", "charm", 4000, 2, 8, "۸٪ جایزه بیشتر — غنیمت ویژه‌ی جنگل زمزمه")
+ITEMS["rel2"] = ("💠 سپر کریستالی", "armor", 9000, 5, 16, "۱۶٪ کاهش خسارت — غنیمت ویژه‌ی غارهای کریستال")
+ITEMS["rel3"] = ("☠️ خنجر زهرآلود", "weapon", 16000, 9, 13, "۱۳٪ شانس پیروزی بیشتر — غنیمت ویژه‌ی مرداب سمی")
+ITEMS["rel4"] = ("🐲 فلس اژدها", "armor", 60000, 13, 34, "۳۴٪ کاهش خسارت — غنیمت ویژه‌ی کوهستان اژدها")
+ITEMS["rel5"] = ("🔥 کلنگ آتشین", "tool", 90000, 18, 42, "+۴۲ سکه در هر کار — غنیمت ویژه‌ی بیابان آتشین")
+ITEMS["rel6"] = ("🌑 تاج شب‌ابدی", "charm", 220000, 24, 50, "۵۰٪ جایزه بیشتر — غنیمت ویژه‌ی ویرانه‌های شب‌ابدی")
+ITEMS["dgn1"] = ("🦴 تبر استخوانی", "weapon", 14000, 9, 13, "۱۳٪ شانس پیروزی بیشتر — غنیمت ویژه‌ی سرداب")
+ITEMS["dgn2"] = ("💀 زره‌ی سایه‌ی سرداب", "armor", 45000, 15, 36, "۳۶٪ کاهش خسارت — غنیمت ویژه‌ی سرداب")
+ITEM_RARITY.update({"rel1": "🟩", "rel2": "🟦", "rel3": "🟦", "rel4": "🟪", "rel5": "🟪", "rel6": "🟧",
+                    "dgn1": "🟦", "dgn2": "🟪"})
+HIDDEN_ITEMS |= {"rel1", "rel2", "rel3", "rel4", "rel5", "rel6", "dgn1", "dgn2"}
+for _k, _v in ITEMS.items():
+    if _k not in ITEM_RARITY:
+        ITEM_RARITY[_k] = _rarity(_v[3])
+ITEM_RARITY.update({"lock": "⚪", "potion": "⚪", "lock2": "🟩", "potion2": "🟩",
+                    "egg1": "⚪", "egg2": "🟦", "egg3": "🟪"})
+FOUND_SELL_RATIO = 0.02   # فروش آیتم‌های پیداشده از غنیمت (جلوگیری از تورم)
+
+# ---------- نژادها ----------
+# کلید: (ایموجی، نام، نام انگلیسی، مزیت، محدودیت، modifierها)
+RACES = {
+    "human": ("🧑", "انسان", "Human", "+۸٪ XP در همه‌ی فعالیت‌ها", "−۳٪ سکه‌ی غنیمت ماجراجویی",
+              {"xp": 1.08, "adv_loot": 0.97}),
+    "elf": ("🧝", "الف", "Elf", "+۶٪ شانس پیروزی در ماجراجویی و +۸٪ شانس غنیمت کمیاب", "−۱۰٪ سکه‌ی کار",
+            {"adv_win": 0.06, "rare": 0.08, "work": 0.90}),
+    "dwarf": ("⛏", "دورف", "Dwarf", "+۱۰٪ سکه‌ی کار و ۱۰٪ کاهش خسارت در ماجراجویی/سرداب", "−۴٪ شانس پیروزی در ماجراجویی",
+              {"work": 1.10, "def": 0.10, "adv_win": -0.04}),
+    "delf": ("🌑", "الف تاریک", "Dark Elf", "+۱۲٪ آسیب به غول‌ها، +۵٪ شانس دزدی، +۲ قدرت دوئل", "−۸٪ XP و −۸٪ سکه‌ی کار",
+             {"dmg": 1.12, "rob": 0.05, "duel": 2, "xp": 0.92, "work": 0.92}),
+}
+_RACE_MULT_KEYS = ("xp", "work", "adv_loot", "dmg")
+
+# ---------- شهرت دائمی ----------
+FAME_TITLES = [(0, "ناشناس"), (50, "شناخته‌شده"), (150, "نام‌آشنا"), (400, "محبوب مردم"), (900, "قهرمان شهر"),
+               (1800, "نام‌آور"), (3500, "افسانه‌ی زنده"), (7000, "اسطوره‌ی الدوریا")]
+
 # ---------- متن‌های رنگارنگ ----------
 WORK_STORIES = {
-    "": [
-        "📦 توی بازار بار جا‌به‌جا کردی و تاجرها انعام حسابی دادن!",
-        "🌾 مزرعه رو شخم زدی؛ عرق ریختی ولی جیب‌ت پر شد!",
-        "🔥 تو کارگاه آهنگری چکش زدی و یه شمشیر تموم کردی!",
-        "🏗 دیوار قلعه رو با بقیه تعمیر کردی؛ فرمانده راضی بود!",
-        "🐎 اسب‌های سلطنتی رو شستی و برق انداختی!",
-        "🪵 هیزم جنگل رو رسوندی به شهر؛ مردم دستت رو بوسیدن!",
-        "🧹 حیاط قصر رو تمیز کردی و یه سکه طلا پیدا کردی!",
-    ],
-    "کارگر": [
-        "🏗 آجرها رو بالا بردی و برج تازه قد کشید!",
-        "🪵 چوب‌های جنگل رو بریدی و کارگاه پر از کار شد!",
-        "🧱 دیوار شکسته رو بازسازی کردی؛ شهر امن‌تر شد!",
-    ],
-    "معدنچی": [
-        "⛏ تو عمق معدن یه رگه‌ی طلا پیدا کردی!",
-        "💎 بین سنگ‌ها یه سنگ قیمتی درخشان کشف کردی!",
-        "🪨 تونل جدید باز کردی و گنج قدیمی از خاک دراومد!",
-    ],
-    "نگهبان": [
-        "🛡 تا صبح دروازه رو نگهبانی دادی؛ هیچ دزدی رد نشد!",
-        "🗼 از برج دیده‌بانی گروه مشکوک رو لو دادی!",
-        "⚔️ یه زد و خورد کوچیک رو آروم کردی؛ مردم تشکر کردن!",
-    ],
-    "تاجر": [
-        "💰 معامله‌ی پرسود بستی و کیسه‌ت سنگین شد!",
-        "🐪 کاروان ادویه رو سالم رسوندی به مقصد!",
-        "📜 قرارداد بزرگ بستی؛ سودش توی جیبته!",
-    ],
-    "راهزن": [
-        "🏴‍☠️ کاروان بی‌دفاع رو غافلگیر کردی!",
-        "🌙 نصف شب از انبار تاجر ثروتمند رد شدی!",
-        "🗡 کمین زدی و غنیمت خوبی جمع کردی!",
-    ],
+    "": ["📦 توی بازار شهر بار حمل کردی و تاجرها کلی انعام دادن!",
+         "🌾 مزرعه‌ی ارباب رو شخم زدی و عرق ریختی!",
+         "🔥 تو کارگاه آهنگری چکش زدی و شمشیر ساختی!",
+         "🏗 دیوار قلعه رو با بقیه تعمیر کردی!",
+         "🐎 اسب‌های اصطبل سلطنتی رو شستی و براق کردی!"],
+    "کارگر": ["🏗 ساعت‌ها آجر جابه‌جا کردی و برج تازه‌ای بالا رفت!", "🪵 چوب‌های جنگل رو بریدی و به کارگاه رسوندی!"],
+    "معدنچی": ["⛏ تو عمق معدن یه رگه‌ی درخشان طلا پیدا کردی!", "💎 بین سنگ‌ها یه تیکه سنگ قیمتی کشف کردی!"],
+    "نگهبان": ["🛡 تا صبح دروازه‌ی شهر رو نگهبانی دادی و هیچ دزدی رد نشد!", "🗼 از برج دیده‌بانی یه گروه مشکوک رو لو دادی!"],
+    "تاجر": ["💰 یه معامله‌ی پرسود بستی و کیسه‌ت سنگین شد!", "🐪 کاروان ادویه رو سالم به مقصد رسوندی!"],
+    "راهزن": ["🏴‍☠️ یه کاروان بی‌دفاع رو غافلگیر کردی!", "🌙 نصف شب از انبار یه تاجر ثروتمند رد شدی!"],
 }
-ADV_WIN = [
-    "🐉 اژدهای آتشین رو شکست دادی و روی گنجش نشستی!",
-    "💎 غار پر از جواهر پیدا کردی؛ چشات برق زد!",
-    "🏴‍☠️ گنج دزدان دریایی رو از ته دریا دراوردی!",
-    "🗝 صندوق گمشده‌ی پادشاه قدیمی رو باز کردی!",
-    "🧙 جادوگر پیر ازت خوشش اومد و پاداش داد!",
-    "🏰 قلعه‌ی ارواح رو تسخیر کردی؛ حالا مال توئه!",
-    "🐺 رئیس گرگ‌ها رو شکست دادی و قلمروشون مال تو شد!",
-    "⚔️ جنگجوی افسانه‌ای رو تو دوئل بردی و شمشیرش رو گرفتی!",
-]
-ADV_LOSE = [
-    "☠️ تو جنگل گم شدی و دزدها جیب‌ت رو خالی کردن!",
-    "🐺 گرگ‌ها حمله کردن؛ با زحمت فرار کردی!",
-    "🌋 غار آتشفشانی غافلگیرت کرد؛ یه کم سوخت شدی!",
-    "🕸 عنکبوت‌های غول‌پیکر گیرت انداختن!",
-    "👻 روح‌ها ازت باج گرفتن و رفتن!",
-    "💨 تله‌ی قدیمی فعال شد و مجبور به عقب‌نشینی شدی!",
-]
+ADV_WIN = ["🐉 اژدهای آتشین رو شکست دادی و روی گنجش نشستی!",
+           "💎 یه غار پر از جواهر پیدا کردی!",
+           "🏴‍☠️ گنج دزدان دریایی رو کشف کردی!",
+           "🗝 صندوق گمشده‌ی پادشاه قدیمی رو باز کردی!",
+           "🧙 جادوگر پیر ازت راضی شد و پاداش داد!",
+           "🏰 قلعه‌ی ارواح رو تسخیر کردی!"]
+ADV_LOSE = ["☠️ تو جنگل تاریک گم شدی و دزدها گیرت انداختن!",
+            "🐺 گرگ‌های وحشی بهت حمله کردن و فرار کردی!",
+            "🌋 تو غار آتشفشانی غافلگیر شدی!",
+            "🕸 عنکبوت‌های غول‌پیکر تو تار گیرت انداختن!",
+            "👻 روح‌های سرگردان ازت باج گرفتن!"]
 LOVE_LINES = ["💞 {a} برای {b} یه دسته گل رز چید 🌹 و {b} از خوشحالی پرواز کرد!",
               "🥰 {a} و {b} زیر نور ماه قدم زدن و دل‌هاشون رو بهم دادن 🌙",
               "💌 {a} یه نامه‌ی عاشقانه برای {b} نوشت و قلب {b} لرزید!",
@@ -401,6 +415,10 @@ CLASSES = {
     "alchemist": ("⚗️ کیمیاگر", "۲۰٪ تخفیف مصرفی‌ها و معجون قوی‌تر (جان ۴۰ به‌جای ۲۵)"),
 }
 GENDERS = {"m": "👨 مرد", "f": "👩 زن"}
+# کلاس مخفی قوی‌تر: توضیحش توی CLASSES همون قبلی می‌مونه، ولی بونوس‌های پنهان زیر رو داره
+HIDDEN_CLASS = "hunter"
+HIDDEN_MULT = 1.08   # +۸٪ سکه‌ی کار و XP
+HIDDEN_DUEL = 2      # +۲ قدرت دوئل
 
 # ارقام فارسی/عربی -> انگلیسی، و ي/ك عربی -> ی/ک فارسی
 NORMALIZE = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩يك",
@@ -413,9 +431,40 @@ db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)  # 
 db.row_factory = sqlite3.Row
 db.execute("PRAGMA journal_mode=WAL")
 db.execute("PRAGMA busy_timeout=5000")
+
+
+def backup_before_migrations():
+    """Snapshot an existing database before CREATE/ALTER migrations run."""
+    if DB_PATH == ":memory:" or not os.path.isfile(DB_PATH) or os.path.getsize(DB_PATH) == 0:
+        return False
+    tmp_path = DB_PATH + ".pre_migration.tmp"
+    dst = None
+    try:
+        dst = sqlite3.connect(tmp_path)
+        with dst:
+            db.backup(dst)
+        dst.close()
+        dst = None
+        os.replace(tmp_path, DB_PATH + ".pre_migration.bak")
+        logging.info("Pre-migration database backup completed: %s.pre_migration.bak", DB_PATH)
+        return True
+    except Exception as exc:
+        logging.exception("Pre-migration backup failed")
+        raise RuntimeError("از دیتابیس قبل از مهاجرت نسخه پشتیبان گرفته نشد؛ برای جلوگیری از ریسک، ربات اجرا نشد.") from exc
+    finally:
+        if dst is not None:
+            dst.close()
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            logging.warning("Could not remove temporary pre-migration backup: %s", tmp_path)
+
+
+backup_before_migrations()
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(
-    id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', coins INTEGER NOT NULL DEFAULT 500);
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', coins INTEGER NOT NULL DEFAULT 100);
 CREATE TABLE IF NOT EXISTS items(
     user_id INTEGER, item TEXT, qty INTEGER DEFAULT 0, PRIMARY KEY(user_id, item));
 CREATE TABLE IF NOT EXISTS cities(chat_id INTEGER PRIMARY KEY, level INTEGER DEFAULT 0);
@@ -519,6 +568,16 @@ CREATE TABLE IF NOT EXISTS chests(
     id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, ts REAL NOT NULL, tier INTEGER NOT NULL,
     claimed_by INTEGER NOT NULL DEFAULT 0, claimed_ts REAL NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_chests_chat ON chests(chat_id);
+CREATE TABLE IF NOT EXISTS adventure_runs(
+    user_id INTEGER PRIMARY KEY, zone INTEGER NOT NULL, step INTEGER NOT NULL, hp INTEGER NOT NULL,
+    max_hp INTEGER NOT NULL, coins INTEGER NOT NULL DEFAULT 0, xp INTEGER NOT NULL DEFAULT 0,
+    phase TEXT NOT NULL DEFAULT 'route', node TEXT NOT NULL DEFAULT '', loot TEXT NOT NULL DEFAULT '[]',
+    stats TEXT NOT NULL DEFAULT '{}', ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS zone_progress(
+    user_id INTEGER NOT NULL, zone INTEGER NOT NULL, clears INTEGER NOT NULL DEFAULT 0,
+    boss_kills INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id, zone));
+CREATE TABLE IF NOT EXISTS found_items(
+    user_id INTEGER NOT NULL, item TEXT NOT NULL, PRIMARY KEY(user_id, item));
 """)
 
 
@@ -545,11 +604,19 @@ ensure_columns("users", {
     "active_pet": _INT0, "last_world": _REAL0, "world_wins": _INT0, "trips": _INT0, "hatched": _INT0,
     "pet_gift": _INT0, "referred_by": _INT0, "ref_paid": _INT0, "refs": _INT0,
     "fal_day": _INT0, "fal_kind": _TXT0, "fal_n": _INT0, "chest_day": _INT0, "chest_n": _INT0,
+    "race": _TXT0, "hero_code": _TXT0, "fame": _INT0, "loot_best": _INT0, "rare_found": _INT0,
+    "adv_boss_kills": _INT0, "adv_chests": _INT0,
 })
 ensure_columns("chats", {"season_seen": _INT0, "world_spawn_seen": _INT0, "world_end_seen": _INT0,
                          "chest_next": _REAL0, "digest_day": _INT0, "digest_off": _INT0})
 ensure_columns("daily_stats", {"sent": _INT0})
 ensure_columns("friend_requests", {"chat_id": _INT0})
+# Indexes are created after migrations because cls/gender/xp may be new columns
+# in databases upgraded from older versions.
+db.execute("CREATE INDEX IF NOT EXISTS idx_market_expires ON market(expires)")
+db.execute("CREATE INDEX IF NOT EXISTS idx_duel_requests_created ON duel_requests(created)")
+db.execute("CREATE INDEX IF NOT EXISTS idx_users_rank ON users(cls, gender, xp DESC, id)")
+db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_hero_code ON users(hero_code) WHERE hero_code<>''")
 
 _TIME_COLS = {"last_work", "last_adv", "last_daily", "last_rob", "last_duel",
               "last_dungeon", "last_bet", "last_love", "last_hit", "last_wheel", "last_world"}
@@ -581,13 +648,65 @@ def tx():
         _tx_depth = 0
 
 
+class _Early(Exception):
+    """برای خروج زودهنگام از tx(): کوروتین پاسخ رو بعد از بستن تراکنش await می‌کنیم."""
+    def __init__(self, coro):
+        self.coro = coro
+
+
+_CODE_ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # بدون حروف/ارقام قابل‌اشتباه
+_sysrand = random.SystemRandom()
+
+
+def ensure_hero_code(uid):
+    """کد اختصاصی و یکتای قهرمان (مستقل از آیدی تلگرام). اگه نداشت می‌سازه."""
+    r = db.execute("SELECT hero_code FROM users WHERE id=?", (uid,)).fetchone()
+    if not r:
+        return ""
+    if r["hero_code"]:
+        return r["hero_code"]
+    for _ in range(60):
+        code = "EL-" + "".join(_sysrand.choice(_CODE_ALPHA) for _ in range(6))
+        try:
+            cur = db.execute("UPDATE users SET hero_code=? WHERE id=? AND hero_code=''", (code, uid))
+        except sqlite3.IntegrityError:
+            continue
+        if cur.rowcount:
+            return code
+        r = db.execute("SELECT hero_code FROM users WHERE id=?", (uid,)).fetchone()
+        return r["hero_code"] if r else ""
+    raise RuntimeError("could not generate unique hero code")
+
+
+# مهاجرت امن: به همه‌ی قهرمان‌های قدیمی کد اختصاصی بده (بدون دست‌زدن به بقیه‌ی اطلاعات)
+for _r in db.execute("SELECT id FROM users WHERE cls<>'' AND gender<>'' AND hero_code=''").fetchall():
+    ensure_hero_code(_r["id"])
+
+
 def backup_db():
+    """ساخت نسخه پشتیبان سازگار با WAL و جایگزینی اتمیک فایل قبلی."""
+    tmp_path = DB_PATH + ".bak.tmp"
+    dst = None
     try:
-        dst = sqlite3.connect(DB_PATH + ".bak")
-        db.backup(dst)
+        dst = sqlite3.connect(tmp_path)
+        with dst:
+            db.backup(dst)
         dst.close()
+        dst = None
+        os.replace(tmp_path, DB_PATH + ".bak")
+        logging.info("Database backup completed: %s.bak", DB_PATH)
+        return True
     except Exception:
         logging.exception("backup failed")
+        return False
+    finally:
+        if dst is not None:
+            dst.close()
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            logging.warning("Could not remove temporary database backup: %s", tmp_path)
 
 
 def cleanup_old():
@@ -621,49 +740,59 @@ def has_char(u):
 
 
 async def check_membership(ctx, uid):
-    """عضویت کانال اجباری را چک می‌کند.
-    گروه خصوصی فقط لینک دعوت نشان داده می‌شود (چک سخت برای invite link ممکن نیست).
-    برمی‌گرداند: (ok: bool, (text, kb) یا None)"""
-    missing_channel = False
-    if REQUIRED_CHANNEL:
-        try:
-            m = await ctx.bot.get_chat_member(f"@{REQUIRED_CHANNEL}", uid)
-            if m.status in ("left", "kicked"):
-                missing_channel = True
-        except Exception as e:
-            # ربات باید ادمین کانال باشد؛ در غیر این صورت چک را رد می‌کنیم تا بازی قفل نشود
-            logging.info("check_membership channel @%s: %s", REQUIRED_CHANNEL, e)
+    """عضویت در کانال/گروه عمومی اجباری را با سیاست fail-closed بررسی می‌کند.
 
-    # اگر کانال اوکی بود و گروه اجباری نداریم → اجازه بده
-    if not missing_channel and not REQUIRED_GROUP:
-        # حتی اگر کانال اوکی باشد، اگر لینک گروه داریم هنوز دکمه‌اش را نشان نده (فقط وقتی کم است)
+    اگر تلگرام پاسخ ندهد، دسترسی موقتاً داده نمی‌شود تا محدودیت با خطای شبکه دور زده نشود.
+    گروه خصوصیِ دارای invite link به‌تنهایی قابل راستی‌آزمایی نیست؛ لینک آن صرفاً نمایش داده می‌شود.
+    """
+    missing = []
+    errors = []
+
+    async def inspect(chat_ref, label):
+        try:
+            member = await ctx.bot.get_chat_member(chat_ref, uid)
+            status = getattr(member, "status", "")
+            is_member = status not in ("left", "kicked")
+            if status == "restricted":
+                is_member = bool(getattr(member, "is_member", False))
+            if not is_member:
+                missing.append(label)
+        except Exception as exc:
+            logging.warning("Membership check failed for %s (%s): %s", label, chat_ref, exc)
+            errors.append(label)
+
+    if REQUIRED_CHANNEL:
+        await inspect(f"@{REQUIRED_CHANNEL}", f"کانال @{REQUIRED_CHANNEL}")
+    if REQUIRED_GROUP:
+        await inspect(f"@{REQUIRED_GROUP}", f"گروه @{REQUIRED_GROUP}")
+
+    if errors:
+        lines = ["⚠️ فعلاً نتونستم عضویتت رو از تلگرام تأیید کنم.",
+                 "چند لحظه بعد دوباره امتحان کن. اگر مشکل ادامه داشت، مدیر ربات باید دسترسی ادمین ربات رو بررسی کنه."]
+        buttons = []
+        if REQUIRED_CHANNEL:
+            buttons.append([Btn("📢 عضویت در کانال", url=f"https://t.me/{REQUIRED_CHANNEL}")])
+        if REQUIRED_GROUP:
+            buttons.append([Btn("👥 ورود به گروه", url=f"https://t.me/{REQUIRED_GROUP}")])
+        elif REQUIRED_GROUP_INVITE:
+            buttons.append([Btn("👥 ورود به گروه", url=REQUIRED_GROUP_INVITE)])
+        return False, ("\n".join(lines), Markup(buttons) if buttons else None)
+
+    if not missing:
         return True, None
 
-    if not missing_channel and REQUIRED_GROUP:
-        # گروه عمومی با یوزرنیم
-        try:
-            m = await ctx.bot.get_chat_member(f"@{REQUIRED_GROUP}", uid)
-            if m.status not in ("left", "kicked"):
-                return True, None
-        except Exception as e:
-            logging.info("check_membership group @%s: %s", REQUIRED_GROUP, e)
-            return True, None  # در صورت خطا قفل نکن
-
-    lines = ["🔒 برای ورود به سرزمین ماجراجویی باید عضو شی:\n"]
+    lines = ["🔒 برای ورود به سرزمین ماجراجویی باید عضو موارد زیر باشی:\n"]
     buttons = []
-    if missing_channel or REQUIRED_CHANNEL:
+    if REQUIRED_CHANNEL and f"کانال @{REQUIRED_CHANNEL}" in missing:
         lines.append(f"• کانال رسمی: @{REQUIRED_CHANNEL}")
         buttons.append([Btn("📢 عضویت در کانال", url=f"https://t.me/{REQUIRED_CHANNEL}")])
-    if REQUIRED_GROUP:
+    if REQUIRED_GROUP and f"گروه @{REQUIRED_GROUP}" in missing:
         lines.append(f"• گروه بازی: @{REQUIRED_GROUP}")
         buttons.append([Btn("👥 ورود به گروه", url=f"https://t.me/{REQUIRED_GROUP}")])
-    elif REQUIRED_GROUP_INVITE:
+    elif not REQUIRED_GROUP and REQUIRED_GROUP_INVITE:
         lines.append("• گروه بازی (لینک دعوت)")
         buttons.append([Btn("👥 ورود به گروه", url=REQUIRED_GROUP_INVITE)])
     lines.append("\nبعد از عضویت دوباره دستور رو بزن ✅")
-    # اگر فقط لینک گروه داریم و کانال اوکی است، اجبار سخت نکن (گروه خصوصی)
-    if not missing_channel and not REQUIRED_GROUP:
-        return True, None
     return False, ("\n".join(lines), Markup(buttons) if buttons else None)
 
 
@@ -703,7 +832,9 @@ def grant_xp(uid, amount):
     """XP می‌ده (جادوگر +۱). برمی‌گردونه: (مقدار واقعی، متن لول‌آپ یا '')."""
     if class_key(uid) == "mage":
         amount += 1
-    amount = max(1, int(round(amount * xp_mult() * (1 + (pet_bonus(uid, "xp") + fal_bonus(uid, "xp")) / 100))))
+    elif class_key(uid) == HIDDEN_CLASS:
+        amount *= HIDDEN_MULT
+    amount = max(1, int(round(amount * xp_mult() * race_mod(uid, "xp") * (1 + (pet_bonus(uid, "xp") + fal_bonus(uid, "xp")) / 100))))
     add_sp(uid, amount)
     pet_gain(uid, max(1, amount // 2))
     old = user_by_id(uid)["xp"]
@@ -750,15 +881,6 @@ def bar(cur, total, n=10):
 
 def cd_left(u, col, seconds):
     return u[col] + seconds - time.time()
-
-
-def work_cd(lvl):
-    """لول پایین سریع‌تر کار کنه تا حوصله‌ش سر نره."""
-    return max(60, WORK_COOLDOWN - (lvl - 1) * 12)
-
-
-def adv_cd(lvl):
-    return max(240, ADVENTURE_COOLDOWN - (lvl - 1) * 20)
 
 
 def set_time(uid, col):
@@ -898,9 +1020,9 @@ def guild_bonus(uid):
     return min(10, n // 3)
 
 
-async def safe_edit(q, text, kb=None):
+async def safe_edit(q, text, kb=None, parse_mode=None):
     try:
-        await q.edit_message_text(text, reply_markup=kb)
+        await q.edit_message_text(text, reply_markup=kb, parse_mode=parse_mode)
     except Exception as e:
         if "not modified" not in str(e):
             logging.warning("safe_edit failed: %s", e)
@@ -1060,10 +1182,62 @@ async def nag_create(update, ctx, force=False):
     if len(_nag) > 5000:
         _nag.clear()
     _nag[uid] = t
-    url = f"https://t.me/{ctx.bot.username}?start=create"
     await update.message.reply_text(
-        "🔒 ای ماجراجو! قبل از ورود به سرزمین باید توی پیوی ربات شخصیتت رو بسازی 🎭",
-        reply_markup=Markup([[Btn("🎭 ساخت شخصیت", url=url)]]))
+        f"⚔️ {clean_name(update.effective_user.first_name)} عزیز، به سرزمین ماجراجویی خوش اومدی!\n"
+        "با ۲ تا کلیک همین‌جا شخصیتت رو بساز و شروع کن 👇\n\nجنسیتت؟",
+        reply_markup=quick_gender_kb(uid))
+
+
+def quick_gender_kb(uid):
+    return Markup([[Btn(GENDERS["m"], f"qs_g:{uid}:m"), Btn(GENDERS["f"], f"qs_g:{uid}:f")]])
+
+
+def quick_race_kb(uid, g):
+    return Markup([[Btn(f"{v[0]} {v[1]} ({v[2]})", f"qs_r:{uid}:{g}:{k}")] for k, v in RACES.items()])
+
+
+def quick_class_kb(uid, g, r):
+    return Markup([[Btn(v[0], f"qs_c:{uid}:{g}:{r}:{k}")] for k, v in CLASSES.items()])
+
+
+async def cb_quick_start(update, ctx):
+    """ساخت سریع شخصیت داخل خود گروه (جنسیت ← نژاد ← کلاس)."""
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) != q.from_user.id:
+        return await q.answer("این منو برای کس دیگه‌ایه؛ خودت بنویس «شروع».", show_alert=True)
+    u = get_user(q.from_user)
+    if has_char(u):
+        return await q.answer("شخصیتت قبلاً ساخته شده.", show_alert=True)
+    g = parts[2]
+    if parts[0] == "qs_g" and g in GENDERS:
+        await q.answer()
+        return await safe_edit(
+            q, f"{GENDERS[g]} انتخاب شد.\n\nنژاد شخصیتت چی باشه؟ (انتخاب دائمیه)\n\n" + race_list_text(),
+            quick_race_kb(q.from_user.id, g))
+    if parts[0] == "qs_r" and len(parts) == 4 and g in GENDERS and parts[3] in RACES:
+        r = parts[3]
+        await q.answer()
+        return await safe_edit(
+            q, f"{GENDERS[g]} • {RACES[r][0]} {RACES[r][1]}\n\nکلاس شخصیتت چی باشه؟\n\n" +
+            "\n".join(f"{v[0]} — {v[1]}" for v in CLASSES.values()), quick_class_kb(q.from_user.id, g, r))
+    if parts[0] == "qs_c" and len(parts) == 5 and g in GENDERS and parts[3] in RACES and parts[4] in CLASSES:
+        if create_character(q.from_user.id, g, parts[4], clean_name(q.from_user.first_name), parts[3]):
+            await q.answer("شخصیت ساخته شد! 🎉")
+            await safe_edit(q, created_text(user_by_id(q.from_user.id)), growth_kb(ctx, q.from_user.id))
+            return await send_event_sticker(ctx, q.message.chat_id, "created", 1.0)
+        return await q.answer("ساخت شخصیت انجام نشد.", show_alert=True)
+    await q.answer()
+
+
+def growth_kb(ctx, uid):
+    """دکمه‌های رشد: افزودن ربات به گروه + دعوت دوستان با لینک رفرال (جایزه‌دار)."""
+    bot = ctx.bot.username
+    add_url = f"https://t.me/{bot}?startgroup=true"
+    share_text = "⚔️ بیا توی سرزمین ماجراجویی! کار کن، غول بکش و با ما رقابت کن. با این لینک هدیه‌ی ویژه می‌گیری 🎁"
+    share_url = f"https://t.me/share/url?url={quote(ref_link(bot, uid))}&text={quote(share_text)}"
+    return Markup([[Btn("➕ افزودن ربات به گروه", url=add_url)],
+                   [Btn("📣 دعوت دوستان (جایزه‌دار)", url=share_url)]])
 
 
 async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1106,6 +1280,8 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔒 این قابلیت از لول {cmd.level} باز می‌شه. لول تو: {lvl}\n"
             "با کار کردن، پوینت گرفتن و بازی XP جمع کن.")
     await cmd.fn(update, ctx, args)
+    if cmd.fn is not cmd_race:
+        await maybe_race_nudge(update, ctx)
     await ach_announce(ctx, chat.id, user.id)
 
 
@@ -1125,13 +1301,14 @@ async def private_router(update, ctx):
             return await msg.reply_text("اسم نامعتبره. ۲ تا ۱۶ حرف (فارسی/انگلیسی/عدد) بفرست.")
         ctx.user_data.pop("creating", None)
         u = get_user(user)
-        if create_character(user.id, state["gender"], state["cls"], name):
-            await msg.reply_text(created_text(user_by_id(user.id)))
+        if create_character(user.id, state["gender"], state["cls"], name, state.get("race", "")):
+            await msg.reply_text(created_text(user_by_id(user.id)), reply_markup=growth_kb(ctx, user.id))
             return await send_event_sticker(ctx, update.effective_chat.id, "created", 1.0)
         return await msg.reply_text("شخصیتت قبلاً ساخته شده.")
     u = get_user(user)
     if has_char(u):
-        return await msg.reply_text("🎮 بازی فقط داخل گروه‌ها انجام می‌شه. برای دیدن دستورها توی گروه «راهنما» رو بزن.")
+        return await msg.reply_text("🎮 بازی فقط داخل گروه‌ها انجام می‌شه. برای دیدن دستورها توی گروه «راهنما» رو بزن.\n"
+                                    "گروه نداری؟ ربات رو به یه گروه اضافه کن 👇", reply_markup=growth_kb(ctx, user.id))
     await msg.reply_text("برای ساخت شخصیت /start رو بزن.")
 
 
@@ -1151,9 +1328,17 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await q.answer("بازی فقط در گروه‌ها قابل اجراست.", show_alert=True)
     if chat.type not in ("group", "supergroup"):
         return await q.answer()
+    if not is_admin(q.from_user.id) and (REQUIRED_CHANNEL or REQUIRED_GROUP):
+        ok, payload = await check_membership(ctx, q.from_user.id)
+        if not ok:
+            text, kb = payload
+            await q.answer("عضویتت هنوز تأیید نشده.", show_alert=True)
+            return await q.message.reply_text(text, reply_markup=kb)
+    if data.startswith("qs_"):
+        return await cb_quick_start(update, ctx)
     u = get_user(q.from_user)
     if not has_char(u) and not is_admin(q.from_user.id):
-        return await q.answer("اول توی پیوی ربات شخصیت بساز.", show_alert=True)
+        return await q.answer("اول شخصیت بساز: توی گروه بنویس «شروع».", show_alert=True)
     handler = CALLBACKS.get(data.split(":", 1)[0])
     if handler:
         await handler(update, ctx)
@@ -1177,22 +1362,25 @@ def gender_kb():
     return Markup([[Btn(GENDERS["m"], "char_gender:m"), Btn(GENDERS["f"], "char_gender:f")]])
 
 
-def class_kb(gender):
-    return Markup([[Btn(v[0], f"char_class:{gender}:{k}")] for k, v in CLASSES.items()])
+def race_kb(gender):
+    return Markup([[Btn(f"{v[0]} {v[1]} ({v[2]})", f"char_race:{gender}:{k}")] for k, v in RACES.items()])
 
 
-def create_character(uid, gender, cls, name):
-    if gender not in GENDERS or cls not in CLASSES:
+def class_kb(gender, race):
+    return Markup([[Btn(v[0], f"char_class:{gender}:{race}:{k}")] for k, v in CLASSES.items()])
+
+
+def create_character(uid, gender, cls, name, race):
+    if gender not in GENDERS or cls not in CLASSES or race not in RACES:
         return False
     with tx():
         u = user_by_id(uid)
         if not u or has_char(u):
             return False
-        db.execute("UPDATE users SET gender=?, cls=?, created=?, name=? WHERE id=?",
-                   (gender, cls, time.time(), name, uid))
-        # پک شروع برای حس خوب اول
-        add_coins(uid, 400)
-        if u["referred_by"]:
+        db.execute("UPDATE users SET gender=?, cls=?, race=?, created=?, name=? WHERE id=?",
+                   (gender, cls, race, time.time(), name, uid))
+        ensure_hero_code(uid)
+        if u["referred_by"]:   # با لینک دعوت یه دوست اومده: هدیه‌ی خوش‌آمد، و به دوستش خبر می‌دیم
             add_coins(uid, REF_WELCOME)
             give_item(uid, "egg1")
             notify(u["referred_by"], f"🤝 {name} با لینک دعوت تو شخصیت ساخت!\n"
@@ -1201,21 +1389,26 @@ def create_character(uid, gender, cls, name):
 
 
 def created_text(u):
-    return (f"🎉🥳 به سرزمین خوش اومدی!\n━━━━━━━━━━━━━━\n"
-            f"👤 {u['name']}   {GENDERS[u['gender']]}\n"
-            f"🎭 {CLASSES[u['cls']][0]}\n✨ {CLASSES[u['cls']][1]}\n"
+    code = ensure_hero_code(u["id"])
+    race = RACES.get(u["race"])
+    return (f"🎉 شخصیتت ساخته شد!\n━━━━━━━━━━━━━━\n"
+            f"👤 {u['name']}  {GENDERS[u['gender']]}\n"
+            f"🆔 کد قهرمان: {code}\n"
+            + (f"🧬 {race[0]} {race[1]} ({race[2]})\n✅ {race[3]}\n⚠️ {race[4]}\n" if race else "")
+            + f"🎭 {CLASSES[u['cls']][0]}\n✨ {CLASSES[u['cls']][1]}\n"
             "━━━━━━━━━━━━━━\n"
-            "⭐ لول ۱ شدی — ماجراجویی شروع شد!\n\n"
-            "🔥 همین الان این کارها رو بکن:\n"
-            "1️⃣ برو توی گروه و بنویس «کار»\n"
-            "2️⃣ بنویس «پوینت» (سکه رایگان)\n"
-            "3️⃣ بنویس «آموزش» و جایزه‌های شروع رو بگیر\n\n"
-            "💰 کار کن → سکه و XP دربیار\n"
-            "🛒 فروشگاه → تجهیزات کلاس خودت رو بخر\n"
-            "🐉 از لول ۲ ماجراجویی و غول باز می‌شه\n\n"
-            "💡 هر کلاس سلاح خودش رو داره:\n"
-            "جنگجو شمشیر · جادوگر عصا · شکارچی کمان\n\n"
-            "🚀 الان برو گروه و اولین «کار»ت رو بزن!")
+            "⭐ لول ۱ شدی!\n\n"
+            "🔥 چطور پول و XP دربیاری؟\n"
+            "• «کار» → سکه + XP (هر ۵ دقیقه)\n"
+            "• «پوینت» → سکه رایگان\n"
+            "• از لول ۲: «ماجراجویی» و «جایزه» روزانه\n\n"
+            "🚀 قدم بعدی:\n"
+            "۱. همین‌جا توی گروه بازی رو شروع کن\n"
+            "۲. بنویس «آموزش» (جایزه‌های شروع) یا «راهنمای الدوریا»\n"
+            "۳. «فروشگاه» رو ببین و تجهیزات کلاس خودت رو بخر\n"
+            "۴. «وضعیت قهرمان» برای دیدن کارت کامل قهرمانت\n\n"
+            "💡 کلاس تو وسایل مخصوص خودش رو داره — جادوگر عصا می‌گیره، جنگجو شمشیر!\n"
+            "🔒 بازی فقط داخل گروه فعال هست.")
 
 
 @command("start", "شروع")
@@ -1229,14 +1422,8 @@ async def cmd_start(update, ctx, args):
             return await msg.reply_text("✅ شخصیتت آماده‌ست؛ بازی رو همین‌جا با دستورهای گروه انجام بده.\nبنویس «راهنما» یا «آموزش».")
         return await nag_create(update, ctx, force=True)
     ctx.user_data.pop("creating", None)
-    # اجبار عضویت قبل از ساخت شخصیت
-    if not is_admin(user.id) and (REQUIRED_CHANNEL or REQUIRED_GROUP):
-        ok, payload = await check_membership(ctx, user.id)
-        if not ok:
-            text, kb = payload
-            return await msg.reply_text(
-                "👋 اول باید عضو شی تا بتونی بازی کنی:\n\n" + text,
-                reply_markup=kb)
+    # عضویت اجباری اینجا چک نمی‌شه تا کاربر اول شخصیتش رو بسازه (ریزش کمتر)؛
+    # اولین دستور داخل گروه عضویت رو چک می‌کنه.
     ref_note = ""
     if args and args[0].startswith("ref_") and args[0][4:].isdigit() and register_ref(u, int(args[0][4:])):
         ref_note = ("🤝 یه دوستت دعوتت کرده! با ساخت شخصیت هدیه‌ی ویژه می‌گیری "
@@ -1246,7 +1433,9 @@ async def cmd_start(update, ctx, args):
             f"🏰 خوش برگشتی {u['name']}!\n━━━━━━━━━━━━━━\n"
             f"{GENDERS[u['gender']]} | {CLASSES[u['cls']][0]} | لول {level_of(u['xp'])}\n\n"
             "🎮 برو توی گروه و بازی کن.\n"
-            "برای شروع سریع بنویس «آموزش» یا «راهنما».")
+            "برای شروع سریع بنویس «آموزش» یا «راهنما».\n\n"
+            "👥 بازی با دوستا جذاب‌تره! ربات رو به گروهت اضافه کن یا دوستات رو دعوت کن 👇",
+            reply_markup=growth_kb(ctx, user.id))
     await msg.reply_text(
         ref_note +
         "⚔️ به سرزمین ماجراجویی خوش اومدی!\n━━━━━━━━━━━━━━\n"
@@ -1266,28 +1455,33 @@ async def character_callbacks(update, ctx):
         g = parts[1]
         await q.answer()
         return await safe_edit(
-            q, f"{GENDERS[g]} انتخاب شد.\n\nحالا کلاس شخصیتت رو انتخاب کن:\n\n" +
-            "\n".join(f"{v[0]} — {v[1]}" for v in CLASSES.values()), class_kb(g))
-    if action in ("char_class", "char_ask", "char_done") and len(parts) == 3 \
-            and parts[1] in GENDERS and parts[2] in CLASSES:
-        g, c = parts[1], parts[2]
+            q, f"{GENDERS[g]} انتخاب شد.\n\nحالا نژاد شخصیتت رو انتخاب کن (دائمیه):\n\n" + race_list_text(), race_kb(g))
+    if action == "char_race" and len(parts) == 3 and parts[1] in GENDERS and parts[2] in RACES:
+        g, r = parts[1], parts[2]
+        await q.answer()
+        return await safe_edit(
+            q, f"{GENDERS[g]} • {RACES[r][0]} {RACES[r][1]}\n\nحالا کلاس شخصیتت رو انتخاب کن:\n\n" +
+            "\n".join(f"{v[0]} — {v[1]}" for v in CLASSES.values()), class_kb(g, r))
+    if action in ("char_class", "char_ask", "char_done") and len(parts) == 4 \
+            and parts[1] in GENDERS and parts[2] in RACES and parts[3] in CLASSES:
+        g, r, c = parts[1], parts[2], parts[3]
         tg_name = clean_name(q.from_user.first_name)
         if action == "char_class":
             await q.answer()
             kb = Markup([
-                [Btn(f"✅ همین اسم: {tg_name[:20]}", f"char_done:{g}:{c}")],
-                [Btn("✏️ اسم دلخواه", f"char_ask:{g}:{c}")],
-                [Btn("↩️ برگشت", f"char_gender:{g}")]])
+                [Btn(f"✅ همین اسم: {tg_name[:20]}", f"char_done:{g}:{r}:{c}")],
+                [Btn("✏️ اسم دلخواه", f"char_ask:{g}:{r}:{c}")],
+                [Btn("↩️ برگشت", f"char_race:{g}:{r}")]])
             return await safe_edit(
-                q, f"{GENDERS[g]} | {CLASSES[c][0]}\n✨ {CLASSES[c][1]}\n\nاسم شخصیتت چی باشه؟", kb)
+                q, f"{GENDERS[g]} | {RACES[r][0]} {RACES[r][1]} | {CLASSES[c][0]}\n✨ {CLASSES[c][1]}\n\nاسم شخصیتت چی باشه؟", kb)
         if action == "char_ask":
-            ctx.user_data["creating"] = {"gender": g, "cls": c}
+            ctx.user_data["creating"] = {"gender": g, "race": r, "cls": c}
             await q.answer()
             return await safe_edit(q, "✏️ اسم شخصیتت رو بفرست (۲ تا ۱۶ حرف، فارسی/انگلیسی/عدد).")
         ctx.user_data.pop("creating", None)
-        if create_character(q.from_user.id, g, c, tg_name):
+        if create_character(q.from_user.id, g, c, tg_name, r):
             await q.answer("شخصیت ساخته شد! 🎉")
-            await safe_edit(q, created_text(user_by_id(q.from_user.id)))
+            await safe_edit(q, created_text(user_by_id(q.from_user.id)), growth_kb(ctx, q.from_user.id))
             return await send_event_sticker(ctx, q.message.chat_id, "created", 1.0)
         return await q.answer("ساخت شخصیت انجام نشد.", show_alert=True)
     await q.answer()
@@ -1313,7 +1507,9 @@ async def cmd_help(update, ctx, args):
         "فصل • جاده • برترین • غول جهانی • تالار افتخار\n\n"
         "📖 جزئیات بیشتر:\n"
         "«آموزش» — ماموریت‌های شروع با جایزه\n"
-        "«پروفایل» — وضعیت کامل خودت\n\n"
+        "«وضعیت قهرمان» — دو صفحه اطلاعات کامل خودت\n"
+        "«راهنمای الدوریا» — دانشنامه‌ی کامل بازی\n"
+        "«نژاد» • «کد قهرمان» • «اکتشاف» • «برترین شهرت»\n\n"
         "🔓 قابلیت‌ها با لول باز می‌شن:\n" +
         "\n".join(f"• لول {lv}: {t}" for lv, t in sorted(UNLOCK_TEXT.items())) +
         "\n\n💡 بازی فقط داخل گروه فعال هست.", parse_mode="HTML")
@@ -1322,57 +1518,96 @@ async def cmd_help(update, ctx, args):
 LINE = "━━━━━━━━━━━━━━"
 
 
-def profile_text(u):
-    uid, lvl = u["id"], level_of(u["xp"])
-    if lvl >= LEVEL_CAP:
-        xp_line = f"✨ XP: {u['xp']:,} (حداکثر لول 👑)"
-    else:
-        base, nxt = xp_for_level(lvl), xp_for_level(lvl + 1)
-        pct = int(100 * (u["xp"] - base) / max(1, nxt - base))
-        xp_line = f"✨ XP: {u['xp']:,} / {nxt:,}\n[{bar(u['xp'] - base, nxt - base)}] {pct}٪"
-    eq = equipped_items(uid)
-    eq_lines = []
-    for sl in SLOTS:
-        if sl in eq:
-            it = ITEMS[eq[sl]]
-            eq_lines.append(f"{SLOT_LABELS[sl]}: {html.escape(gear_name(uid, eq[sl]))} <i>(+{enhanced_power(uid, eq[sl])})</i>")
-        else:
-            eq_lines.append(f"{SLOT_LABELS[sl]}: —")
-    g = guild_of(uid)
-    bal = db.execute("SELECT amount FROM bank WHERE user_id=?", (uid,)).fetchone()
-    sp = spouse_of(uid)
-    games = u["duel_wins"] + u["duel_losses"]
-    rate = f" ({int(100 * u['duel_wins'] / games)}٪)" if games else ""
-    return "\n".join([
-        LINE,
-        f"👑 <b>{html.escape(u['name'])}</b>  {GENDERS.get(u['gender'], '❔')}",
-        f"{CLASSES[u['cls']][0]}  •  🏅 {html.escape(title_of(lvl))}",
-        LINE,
-        f"⭐ لول <b>{lvl}</b>",
-        xp_line,
-        LINE,
-        f"💰 سکه: <b>{u['coins']:,}</b>   🏦 بانک: {(bal['amount'] if bal else 0):,}",
-        f"💼 شغل: {html.escape(u['job'] or 'بیکار')}",
-        f"🏰 انجمن: {html.escape(g['name']) if g else '—'}",
-        f"💍 همسر: {html.escape(sp[0]['name']) if sp else '—'}",
-        LINE,
-        f"⚔️ دوئل: {u['duel_wins']} برد / {u['duel_losses']} باخت{rate}",
-        f"🔨 کار: {u['work_count']}   🗺 ماجراجویی: {u['adv_count']}",
-        f"🐉 غول‌کشی: {u['boss_kills']}   📣 دعوت: {u['invites']}",
-        f"🏅 مدال‌ها: {ach_badges(uid)}",
-        f"🌟 فصل {season_now()['no']}: {sp_of(uid):,} امتیاز (رتبه‌ی {sp_rank(uid)})",
-        *([html.escape(season_title(uid))] if season_title(uid) else []),
-        pet_profile_line(uid),
-        f"⚡ قدرت رزمی: <b>{int(duel_power(u))}</b>",
-        LINE,
-        "🎒 <b>تجهیزات فعال</b>",
-        *eq_lines,
-        LINE,
-    ])
+def render_hero_card(u):
+    """ساخت کارت تصویری قهرمان در حافظه؛ وابستگی Pillow در صورت نصب استفاده می‌شود."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    W, H = 1280, 720
+    im = Image.new("RGB", (W, H))
+    px = im.load()
+    for y in range(H):
+        t = y / max(1, H - 1)
+        c = (int(10 + 13*t), int(17 + 15*t), int(39 + 34*t))
+        for x in range(W):
+            glow = max(0.0, 1 - (((x-1030)/620)**2 + ((y-70)/500)**2)**0.5) * 22
+            px[x, y] = (min(255, c[0]+int(glow*.25)), min(255, c[1]+int(glow*.45)), min(255, c[2]+int(glow)))
+
+    d = ImageDraw.Draw(im)
+    # Fonts: RAQM shapes Persian text when the host has libraqm; graceful fallback otherwise.
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    bold_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ]
+    def load_font(paths, size):
+        for path in paths:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size, layout_engine=ImageFont.Layout.RAQM)
+                except Exception:
+                    try: return ImageFont.truetype(path, size)
+                    except Exception: pass
+        return ImageFont.load_default()
+    f_small = load_font(font_paths, 25)
+    f_mid = load_font(font_paths, 31)
+    f_big = load_font(bold_paths, 58)
+    f_title = load_font(bold_paths, 34)
+
+    # Decorative frame and header
+    d.rounded_rectangle((34, 34, W-34, H-34), radius=34, outline=(91, 116, 181), width=3)
+    d.rounded_rectangle((65, 65, W-65, 165), radius=25, fill=(22, 35, 73), outline=(79, 104, 170), width=2)
+    d.text((W-95, 94), "ELDORIA  /  HERO ARCHIVE", font=f_title, fill=(235, 220, 170), anchor="ra")
+
+    name = str(u["name"] or "Hero")[:28]
+    lvl = level_of(u["xp"])
+    rank = db.execute("SELECT COUNT(*) + 1 FROM users WHERE cls<>'' AND (xp>? OR (xp=? AND id<?))",
+                      (u["xp"], u["xp"], u["id"])).fetchone()[0]
+    bal = db.execute("SELECT amount FROM bank WHERE user_id=?", (u["id"],)).fetchone()
+    power = int(duel_power(u))
+    ach_count = db.execute("SELECT COUNT(*) FROM achievements WHERE user_id=?", (u["id"],)).fetchone()[0]
+    class_name = CLASSES.get(u["cls"], ("Adventurer",))[0]
+
+    d.text((W-100, 225), name, font=f_big, fill=(255, 255, 255), anchor="ra", direction="rtl")
+    d.text((W-100, 300), f"{class_name}   •   {title_of(lvl)}", font=f_mid, fill=(177, 197, 239), anchor="ra", direction="rtl")
+    d.rounded_rectangle((95, 215, 390, 565), radius=28, fill=(25, 40, 82), outline=(112, 133, 194), width=2)
+    d.text((242, 285), "LEVEL", font=f_mid, fill=(180, 197, 232), anchor="mm")
+    d.text((242, 365), str(lvl), font=load_font(bold_paths, 92), fill=(255, 221, 139), anchor="mm")
+    d.text((242, 465), f"GLOBAL RANK  #{rank}", font=f_small, fill=(210, 222, 246), anchor="mm")
+
+    stats = [
+        ("COMBAT POWER", f"{power:,}"),
+        ("COINS", f"{u['coins']:,}"),
+        ("BANK", f"{(bal['amount'] if bal else 0):,}"),
+        ("DUEL WINS", f"{u['duel_wins']:,}"),
+        ("BOSS WINS", f"{u['boss_kills']:,}"),
+        ("MEDALS", f"{ach_count}/{len(ACHS)}"),
+    ]
+    x0, y0, cw, ch, gap = 445, 375, 220, 112, 22
+    for i, (label, value) in enumerate(stats):
+        col, row = i % 3, i // 3
+        x, y = x0 + col*(cw+gap), y0 + row*(ch+18)
+        d.rounded_rectangle((x, y, x+cw, y+ch), radius=20, fill=(26, 43, 87), outline=(70, 94, 154), width=2)
+        d.text((x+cw//2, y+33), label, font=f_small, fill=(164, 185, 226), anchor="mm")
+        d.text((x+cw//2, y+78), value, font=f_title, fill=(255, 255, 255), anchor="mm")
+
+    d.text((W-95, H-58), "YOUR LEGEND IS STILL BEING WRITTEN", font=f_small, fill=(157, 178, 218), anchor="ra")
+    out = BytesIO()
+    im.save(out, format="PNG", optimize=True)
+    out.seek(0)
+    out.name = "eldoria_hero_card.png"
+    return out
 
 
-@command("پروفایل", "profile")
-async def cmd_profile(update, ctx, args):
+@command("کارت تصویری", "پروفایل تصویری", "profilecard")
+async def cmd_profile_card(update, ctx, args):
     msg = update.message
     rt = msg.reply_to_message
     if rt and rt.from_user and not rt.from_user.is_bot and rt.from_user.id != update.effective_user.id:
@@ -1381,24 +1616,25 @@ async def cmd_profile(update, ctx, args):
             return await msg.reply_text("این بازیکن هنوز شخصیت نساخته.")
     else:
         u = get_user(update.effective_user)
-    await send_event_sticker(ctx, update.effective_chat.id, "profile", 0.6)
-    kb = None
-    if u["id"] == update.effective_user.id and ctx.bot.username:
-        kb = Markup([[Btn("📤 اشتراک‌گذاری کارت قهرمان",
-                          url=share_url(ref_link(ctx.bot.username, u["id"]), share_card_text(u)))]])
-    await msg.reply_text(profile_text(u), parse_mode="HTML", reply_markup=kb)
+    card = render_hero_card(u)
+    if card is None:
+        return await msg.reply_text("برای ساخت کارت تصویری، کتابخانه Pillow را نصب کن: pip install Pillow")
+    await msg.reply_photo(photo=card, caption=f"🌌 کارت قهرمان {u['name']} در الدوریا")
 
 
 # ============================== کار، پوینت، ماجراجویی، جایزه ==============================
 @command("کار", "work")
 async def cmd_work(update, ctx, args):
     u = get_user(update.effective_user)
-    uid, lvl = u["id"], level_of(u["xp"])
-    left = cd_left(u, "last_work", work_cd(lvl))
+    uid = u["id"]
+    left = cd_left(u, "last_work", WORK_COOLDOWN)
     if left > 0:
-        return await update.message.reply_text(f"⏳ {fmt_time(left)} دیگه آماده‌ای برای کار.")
-    gain = (random.randint(10, 16) + lvl + best_power(uid, "tool")
+        return await update.message.reply_text(f"⏳ {fmt_time(left)} دیگه می‌تونی کار کنی.")
+    gain = (random.randint(8, 14) + level_of(u["xp"]) + best_power(uid, "tool")
             + JOB_WORK.get(u["job"], 0) + (2 if u["cls"] == "hunter" else 0))
+    if u["cls"] == HIDDEN_CLASS:
+        gain = int(gain * HIDDEN_MULT)
+    gain = int(gain * race_mod(uid, "work"))
     bonus = guild_bonus(uid)
     gain = int(gain * (1 + bonus / 100))
     ev_mult, ev_label = event_mult()
@@ -1407,29 +1643,28 @@ async def cmd_work(update, ctx, args):
     married = spouse_of(uid) is not None
     if married:
         gain = int(gain * (1 + MARRY_BONUS / 100))
-    # لول پایین کمی سکه بیشتر بگیره تا حس پیشرفت قوی‌تر باشه
-    if lvl <= 5:
-        gain = int(gain * 1.15)
     with tx():
         db.execute("UPDATE users SET coins=coins+?, last_work=?, work_count=work_count+1 WHERE id=?",
                    (gain, time.time(), uid))
         bump(uid, "work")
-        xp, note = grant_xp(uid, 8 if lvl <= 5 else 6)
+        xp, note = grant_xp(uid, 6)
     perks = []
     if bonus:
-        perks.append(f"🏰 +{bonus}٪")
+        perks.append(f"🏰 انجمن +{bonus}٪")
     if married:
-        perks.append(f"💍 +{MARRY_BONUS}٪")
+        perks.append(f"💍 همسر +{MARRY_BONUS}٪")
     if pet_c:
-        perks.append(f"🐾 +{pet_c:.0f}٪")
+        perks.append(f"🐾 همراه +{pet_c:.0f}٪")
     if fal_c:
-        perks.append(f"🔮 +{fal_c:.0f}٪")
+        perks.append(f"🔮 فال +{fal_c:.0f}٪")
     if ev_mult > 1:
         perks.append(f"{ev_label} ×{ev_mult:g}")
+    if season_perk("work_coins") > 1:
+        perks.append(f"{season_theme(season_now()['no'])[0]} مزیت فصل +{int(round((season_perk('work_coins') - 1) * 100))}٪")
     story = random.choice(WORK_STORIES.get(u["job"], WORK_STORIES[""]))
-    text = f"{story}\n━━━━━━━━━━━━━━\n💰 +{gain:,} سکه   ✨ +{xp} XP"
+    text = f"{story}\n━━━━━━━━━━━━━━\n💰 +{gain:,} سکه\n✨ +{xp} XP"
     if perks:
-        text += "\n" + " · ".join(perks)
+        text += "\n" + "  ".join(perks)
     chat_score(update.effective_chat.id, 2)
     await reply_game(update, ctx, text + note, "work")
 
@@ -1467,40 +1702,8 @@ async def cmd_point(update, ctx, args):
                    (uid, chat_id, time.time()))
         bump(uid, "point")
         xp, note = grant_xp(uid, 4)
-    await reply_game(update, ctx,
-                     f"⭐ پوینت آماده بود!\n━━━━━━━━━━━━━━\n💰 +{gain} سکه   ✨ +{xp} XP" + note,
-                     "point", STICKER_CHANCE * 0.4)
+    await reply_game(update, ctx, f"⭐ پوینت گرفتی!\n━━━━━━━━━━━━━━\n💰 +{gain} سکه\n✨ +{xp} XP" + note, "point", STICKER_CHANCE * 0.6)
     chat_score(update.effective_chat.id, 1)
-
-
-@command("ماجراجویی", "adventure", level=2)
-async def cmd_adventure(update, ctx, args):
-    u = get_user(update.effective_user)
-    uid, lvl = u["id"], level_of(u["xp"])
-    left = cd_left(u, "last_adv", adv_cd(lvl))
-    if left > 0:
-        return await update.message.reply_text(f"⏳ {fmt_time(left)} دیگه می‌تونی بری ماجراجویی.")
-    chance = min(0.50 + best_power(uid, "weapon") / 100 + lvl * 0.005 + (pet_bonus(uid, "luck") + fal_bonus(uid, "luck")) / 100, 0.90)
-    if random.random() < chance:
-        gain = int(random.randint(30, 80) * (1 + lvl * 0.04) * reward_mult(uid) * season_perk("adv_coins")
-                   * (1 + (pet_bonus(uid, "loot") + fal_bonus(uid, "loot")) / 100))
-        won, base_xp, delta = True, 15, gain
-        result = f"{random.choice(ADV_WIN)}\n━━━━━━━━━━━━━━\n💰 +{gain:,} سکه"
-    else:
-        reduction = min(0.70, best_power(uid, "armor") / 100 + (0.05 if u["cls"] == "warrior" else 0)
-                        + pet_bonus(uid, "defense") / 100)
-        loss = int(u["coins"] * random.uniform(0.05, 0.12) * (1 - reduction))
-        loss = min(max(10, loss), u["coins"])
-        won, base_xp, delta = False, 5, -loss
-        result = (f"{random.choice(ADV_LOSE)}\n━━━━━━━━━━━━━━\n💸 -{loss:,} سکه\n"
-                  "💡 زره، خسارت رو کم می‌کنه و پول بانک امنه.")
-    with tx():
-        db.execute("UPDATE users SET coins=MAX(0, coins+?), last_adv=?, adv_count=adv_count+1 WHERE id=?",
-                   (delta, time.time(), uid))
-        bump(uid, "adv")
-        xp, note = grant_xp(uid, base_xp)
-    chat_score(update.effective_chat.id, 4 if won else 1)
-    await reply_game(update, ctx, result + f"\n✨ +{xp} XP" + note, "win" if won else "lose")
 
 
 @command("جایزه", "daily", level=2)
@@ -1584,44 +1787,65 @@ async def cmd_missions(update, ctx, args):
 
 
 # ============================== فروشگاه و کوله ==============================
+SHOP_PER_PAGE = 5
+
+
 def shop_main_view(uid):
     u = user_by_id(uid)
     cls_name = CLASSES.get(u["cls"], ("",))[0] if u else ""
-    kb = [[Btn(label, f"shop:{uid}:{cat}")] for cat, label in CATEGORIES.items()]
-    text = f"🏪 فروشگاه  ·  💰 {u['coins']:,}  ·  {cls_name}"
+    race = RACES.get(u["race"]) if u else None
+    race_name = f"{race[0]} {race[1]}" if race else "—"
+    kb = [[Btn(label, f"shop:{uid}:{cat}:0")] for cat, label in CATEGORIES.items()]
+    rar = "  ".join(f"{v[0]} {v[1]}" for v in RARITY.values())
+    text = (f"🏪 بازار بزرگ الدوریا\n━━━━━━━━━━━━━━\n"
+            f"💰 سکه‌ات: {u['coins']:,}   ⭐ لول: {level_of(u['xp'])}\n"
+            f"🎭 کلاس: {cls_name}   🧬 نژاد: {race_name}\n\n"
+            f"📖 درجه‌های کمیابی:\n{rar}\n\n"
+            "دسته‌ی مورد نظرت رو انتخاب کن:\n"
+            "💡 وسایل مخصوص کلاس خودت فقط برای تو نمایش داده می‌شه.\n"
+            "🗺 غنیمت‌های ویژه فقط از ماجراجویی و سرداب میان.")
     return text, Markup(kb)
 
 
-def shop_cat_view(cat, u):
-    """همه اطلاعات داخل دکمه‌هاست — متن بالا خیلی کوتاه."""
+def shop_cat_view(cat, u, page=0):
     uid, lvl, have = u["id"], level_of(u["xp"]), owned(u["id"])
-    kb, hidden = [], 0
-    for key, (name, c, _, minlvl, power, desc) in sorted(ITEMS.items(), key=lambda kv: (kv[1][3], kv[1][2])):
+    entries, hidden = [], 0
+    for key, (name, c, _p, minlvl, power, desc) in sorted(ITEMS.items(), key=lambda kv: (kv[1][3], kv[1][2])):
         if c != cat or key in HIDDEN_ITEMS:
             continue
         if not item_usable(u, key):
             hidden += 1
             continue
+        entries.append((key, name, minlvl, power, desc))
+    pages = max(1, (len(entries) + SHOP_PER_PAGE - 1) // SHOP_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    lines = [f"{CATEGORIES[cat]}   (صفحه {page + 1}/{pages})", "━━━━━━━━━━━━━━",
+             f"💰 سکه‌ات: {u['coins']:,}   ⭐ لول: {lvl}", ""]
+    kb = []
+    for key, name, minlvl, power, desc in entries[page * SHOP_PER_PAGE:(page + 1) * SHOP_PER_PAGE]:
         price = item_price(u, key)
-        tag = ITEM_RARITY.get(key, "")
-        req = req_label(key)
-        if key in have and cat != "misc":
-            label = f"✅ {tag}{name}{req}"
-            kb.append([Btn(label, f"buy:{uid}:{key}")])  # کلیک بی‌اثر یا پیام داری
-        elif lvl < minlvl:
-            label = f"🔒 {tag}{name} — {price:,} (لول {minlvl})"
-            kb.append([Btn(label, f"buy:{uid}:{key}")])
+        stats = f"💰 {price:,} • ⭐ لول {minlvl}" + (f" • 💪 قدرت {power}" if cat != "misc" else "")
+        lines.append(f"{rarity_label(key)}  {name}{req_label(key)}\n   {stats}\n   ✨ {desc}")
+        if lvl < minlvl and not is_admin(uid):
+            lines.append(f"   🔒 قفله — با رسیدن به لول {minlvl} باز می‌شه\n")
+        elif cat != "misc" and key in have:
+            lines.append("   ✅ داری\n")
         else:
-            label = f"{tag}{name}{req} — {price:,}"
-            kb.append([Btn(label, f"buy:{uid}:{key}")])
-    if not kb:
-        text = f"{CATEGORIES[cat]}\n💰 {u['coins']:,}\n\nچیزی برای کلاس تو اینجا نیست."
-    else:
-        text = f"{CATEGORIES[cat]}  ·  💰 {u['coins']:,}"
-        if hidden:
-            text += f"\n🔐 {hidden} وسیله‌ی کلاس‌های دیگه مخفیه"
-    kb.append([Btn("⬅️ برگشت", f"shop:{uid}:main")])
-    return text, Markup(kb)
+            lines.append("")
+            kb.append([Btn(f"🛒 {name} • {price:,}", f"buy:{uid}:{key}:{page}")])
+    if not entries:
+        lines.append("هیچ وسیله‌ای برای کلاس/شغل تو در این دسته نیست.")
+    if hidden:
+        lines.append(f"🔐 {hidden} وسیله‌ی مخصوص کلاس یا شغل‌های دیگه مخفیه.")
+    nav = []
+    if page > 0:
+        nav.append(Btn("◀️ قبلی", f"shop:{uid}:{cat}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(Btn("بعدی ▶️", f"shop:{uid}:{cat}:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([Btn("⬅️ برگشت", f"shop:{uid}:main:0")])
+    return "\n".join(lines), Markup(kb)
 
 
 @command("فروشگاه", "shop")
@@ -1642,58 +1866,61 @@ async def _own_panel(q, owner):
 async def cb_shop(update, ctx):
     q = update.callback_query
     parts = (q.data or "").split(":")
-    if len(parts) != 3 or parts[1] != str(q.from_user.id):
+    if len(parts) not in (3, 4) or parts[1] != str(q.from_user.id):
         return await q.answer("این پنل برای تو نیست؛ خودت «فروشگاه» رو بزن.", show_alert=True)
     cat = parts[2]
     if cat != "main" and cat not in CATEGORIES:
         return await q.answer()
+    page = int(parts[3]) if len(parts) == 4 and parts[3].isdigit() else 0
     u = get_user(q.from_user)
-    text, kb = shop_main_view(u["id"]) if cat == "main" else shop_cat_view(cat, u)
+    text, kb = shop_main_view(u["id"]) if cat == "main" else shop_cat_view(cat, u, page)
     await q.answer()
     await safe_edit(q, text, kb)
 
 
 def buy_item(uid, key):
     if key not in ITEMS or key in HIDDEN_ITEMS:
-        return False, "وسیله نامعتبره."
+        return False, "🚫 این وسیله نامعتبره."
     name, cat, _, minlvl, power, _ = ITEMS[key]
     with tx():
         u = user_by_id(uid)
         if not item_usable(u, key):
-            return False, f"🔐 این وسیله فقط برای {req_text(key)} قابل خریده."
+            who = req_text(key) or "جنگجو و نینجا"
+            return False, f"🔐 این وسیله فقط برای {who} قابل خریده."
         if level_of(u["xp"]) < minlvl and not is_admin(uid):
-            return False, f"🔒 این وسیله از لول {minlvl} باز می‌شه."
+            return False, f"🔒 این وسیله از لول {minlvl} باز می‌شه؛ هنوز زوده!"
         if cat == "misc":
             if qty(uid, key) >= CONSUMABLE_MAX:
-                return False, f"حداکثر {CONSUMABLE_MAX} تا می‌تونی داشته باشی."
+                return False, f"🎒 کوله‌ات پره! حداکثر {CONSUMABLE_MAX} تا از این رو می‌تونی داشته باشی."
         elif qty(uid, key) > 0:
-            return False, "این وسیله رو قبلاً داری."
+            return False, "✅ این وسیله رو قبلاً داری."
         elif db.execute("SELECT 1 FROM market WHERE seller=? AND item=?", (uid, key)).fetchone():
-            return False, "این وسیله رو الان توی بازار گذاشتی."
+            return False, "🏷 این وسیله رو الان توی بازار گذاشتی."
         price = item_price(u, key)
         if not spend(uid, price):
-            return False, f"سکه‌ات کافی نیست! (قیمت: {price:,})"
+            return False, f"💸 سکه‌ات کافی نیست! قیمت: {price:,} • کمبود: {price - u['coins']:,}"
         db.execute("INSERT INTO items(user_id, item, qty) VALUES(?,?,1) "
                    "ON CONFLICT(user_id, item) DO UPDATE SET qty=qty+1", (uid, key))
-        msg = f"{name} خریدی! ✅"
+        msg = f"🛍✨ {name} مال توئه! (−{price:,} سکه)\n{rarity_label(key)}"
         if cat in SLOTS:
             cur = db.execute("SELECT item FROM equipped WHERE user_id=? AND slot=?", (uid, cat)).fetchone()
             if not cur or cur["item"] not in ITEMS or enhanced_power(uid, cur["item"]) < enhanced_power(uid, key):
                 db.execute("INSERT INTO equipped(user_id, slot, item) VALUES(?,?,?) "
                            "ON CONFLICT(user_id, slot) DO UPDATE SET item=excluded.item", (uid, cat, key))
-                msg += " (خودکار فعال شد)"
+                msg += " — خودکار فعال شد ⚡"
     return True, msg
 
 
 async def cb_buy(update, ctx):
     q = update.callback_query
     parts = (q.data or "").split(":")
-    if len(parts) != 3 or parts[1] != str(q.from_user.id):
+    if len(parts) not in (3, 4) or parts[1] != str(q.from_user.id):
         return await q.answer("این پنل برای تو نیست؛ خودت «فروشگاه» رو بزن.", show_alert=True)
     ok, msg = buy_item(q.from_user.id, parts[2])
     await q.answer(msg, show_alert=True)
     if ok:
-        text, kb = shop_cat_view(ITEMS[parts[2]][1], user_by_id(q.from_user.id))
+        page = int(parts[3]) if len(parts) == 4 and parts[3].isdigit() else 0
+        text, kb = shop_cat_view(ITEMS[parts[2]][1], user_by_id(q.from_user.id), page)
         await safe_edit(q, text, kb)
 
 
@@ -1714,7 +1941,7 @@ def inventory_view(uid):
             lines.append(mark + f"{gear_name(uid, key)}{req_label(key)} — قدرت {enhanced_power(uid, key)}")
             if not active:
                 row = [Btn(f"فعال‌سازی {ITEMS[key][0]}", f"equip:{uid}:{key}")] if ok else []
-                row.append(Btn(f"فروش +{int(ITEMS[key][2] * SELL_RATIO):,}", f"sell:{uid}:{key}"))
+                row.append(Btn(f"فروش +{sell_price(uid, key):,}", f"sell:{uid}:{key}"))
                 kb.append(row)
         lines.append("")
     misc = [(k, n) for k, n in have.items() if k in ITEMS and ITEMS[k][1] == "misc"]
@@ -1741,8 +1968,9 @@ def sell_item(uid, key):
             return False, "این وسیله رو نداری."
         if equipped_items(uid).get(slot) == key:
             return False, "وسیله‌ی فعال رو نمی‌تونی بفروشی؛ اول یه وسیله‌ی دیگه فعال کن."
-        price = int(ITEMS[key][2] * SELL_RATIO)
+        price = sell_price(uid, key)
         db.execute("UPDATE items SET qty=0 WHERE user_id=? AND item=?", (uid, key))
+        db.execute("DELETE FROM found_items WHERE user_id=? AND item=?", (uid, key))
         add_coins(uid, price)
     return True, f"{ITEMS[key][0]} فروخته شد: +{price:,} سکه"
 
@@ -1811,25 +2039,28 @@ async def cmd_bank(update, ctx, args):
 @command("واریز", "deposit", args=True, level=3)
 async def cmd_deposit(update, ctx, args):
     uid = get_user(update.effective_user)["id"]
-    with tx():
-        u = user_by_id(uid)
-        lvl = level_of(u["xp"])
-        bal = bank_balance(uid)
-        room = max(0, bank_cap(lvl) - bal)
-        if room <= 0:
-            return await update.message.reply_text(
-                f"🏦 بانکت پره! ظرفیتت {bank_cap(lvl):,} سکه‌ست. با بالا رفتن لول بیشتر می‌شه.")
-        amt = parse_amount(args[0], min(u["coins"], room)) if args else None
-        if not amt or amt <= 0:
-            return await update.message.reply_text("مثال: واریز 100  یا  واریز همه")
-        if amt > u["coins"]:
-            return await update.message.reply_text("پول دستت کافی نیست.")
-        if amt > room:
-            return await update.message.reply_text(f"ظرفیت بانکت فقط {room:,} سکه جا داره.")
-        db.execute("UPDATE users SET coins=coins-? WHERE id=?", (amt, uid))
-        db.execute("INSERT INTO bank(user_id, amount, ts) VALUES(?,?,?) "
-                   "ON CONFLICT(user_id) DO UPDATE SET amount=amount+excluded.amount, ts=excluded.ts",
-                   (uid, amt, time.time()))
+    try:
+        with tx():
+            u = user_by_id(uid)
+            lvl = level_of(u["xp"])
+            bal = bank_balance(uid)
+            room = max(0, bank_cap(lvl) - bal)
+            if room <= 0:
+                raise _Early(update.message.reply_text(
+                    f"🏦 بانکت پره! ظرفیتت {bank_cap(lvl):,} سکه‌ست. با بالا رفتن لول بیشتر می‌شه."))
+            amt = parse_amount(args[0], min(u["coins"], room)) if args else None
+            if not amt or amt <= 0:
+                raise _Early(update.message.reply_text("مثال: واریز 100  یا  واریز همه"))
+            if amt > u["coins"]:
+                raise _Early(update.message.reply_text("پول دستت کافی نیست."))
+            if amt > room:
+                raise _Early(update.message.reply_text(f"ظرفیت بانکت فقط {room:,} سکه جا داره."))
+            db.execute("UPDATE users SET coins=coins-? WHERE id=?", (amt, uid))
+            db.execute("INSERT INTO bank(user_id, amount, ts) VALUES(?,?,?) "
+                       "ON CONFLICT(user_id) DO UPDATE SET amount=amount+excluded.amount, ts=excluded.ts",
+                       (uid, amt, time.time()))
+    except _Early as _e:
+        return await _e.coro
     await update.message.reply_text(f"🏦 {amt:,} سکه واریز شد.")
 
 
@@ -1996,6 +2227,7 @@ def do_rob(me_id, v_id, v_name):
             chance += 0.10
         if me["cls"] == "ninja":
             chance += 0.05
+        chance += race_mod(me_id, "rob")
         if v["job"] == "نگهبان":
             chance -= 0.10
         chance = max(0.10, min(0.70, chance))
@@ -2032,7 +2264,8 @@ async def cmd_rob(update, ctx, args):
 # ============================== دوئل ==============================
 def duel_power(u):
     return (best_power(u["id"], "weapon") + best_power(u["id"], "armor") / 2
-            + level_of(u["xp"]) / 2 + (5 if u["cls"] == "warrior" else 0))
+            + level_of(u["xp"]) / 2 + (5 if u["cls"] == "warrior" else 0)
+            + (HIDDEN_DUEL if u["cls"] == HIDDEN_CLASS else 0) + race_mod(u["id"], "duel"))
 
 
 @command("دوئل", "duel", args=True, level=10)
@@ -2100,6 +2333,7 @@ def resolve_duel(rid, clicker, answer):
         db.execute("UPDATE users SET coins=coins+?, duel_wins=duel_wins+1 WHERE id=?", (prize, win["id"]))
         db.execute("UPDATE duel_requests SET status='done' WHERE id=?", (rid,))
         _, nw = grant_xp(win["id"], 25)
+        add_fame(win["id"], 3)
         _, nl = grant_xp(lose["id"], 8)
     return "edit", (f"⚔️ نتیجه‌ی دوئل\n\n🏆 {win['name']} برنده شد و {prize} سکه گرفت!\n"
                     f"😵 {lose['name']} باخت و {stake} سکه از دست داد.{nw}{nl}")
@@ -2135,22 +2369,58 @@ async def cmd_bet(update, ctx, args):
     if left > 0:
         return await update.message.reply_text(f"⏳ {fmt_time(left)} دیگه می‌تونی شرط ببندی.")
     won = random.random() < 0.45
+    broke = False
     with tx():
         set_time(u["id"], "last_bet")
         if won:
             add_coins(u["id"], amount)
         elif not spend(u["id"], amount):
-            return await update.message.reply_text("پول دستت کافی نیست.")
-        _, note = grant_xp(u["id"], 2)
+            broke = True
+        else:
+            pass
+        if not broke:
+            _, note = grant_xp(u["id"], 2)
+    if broke:
+        return await update.message.reply_text("پول دستت کافی نیست.")
     await reply_game(update, ctx, (f"🎰 شانس باهات یار بود! 🤑\n━━━━━━━━━━━━━━\n💰 +{amount:,} سکه" if won
                                    else f"🎰 این دفعه شانس نیاوردی 😢\n━━━━━━━━━━━━━━\n💸 -{amount:,} سکه") + note,
                      "win" if won else "lose")
 
 
 # ============================== سرداب (وضعیت سمت سرور) ==============================
-def dungeon_view(uid, stage, hp, loot):
+# سرداب = نبرد مرحله‌ای ۳‌تایی با ریسک مرگ و از دست رفتن غنیمت. دشمن‌ها با لول قهرمان بزرگ می‌شن.
+DUNGEON_ENEMIES = {
+    1: [("💀", "اسکلت نگهبان", 1.0), ("🕷", "عنکبوت غول‌پیکر", 1.0), ("👺", "گابلین قاتل", 1.1), ("🦇", "خفاش‌های وحشی", 0.9)],
+    2: [("🧟", "غول مرده‌ی متحرک", 1.2), ("👻", "روح سرگردان", 1.1), ("🗿", "نگهبان سنگی", 1.3), ("🐍", "مار سیاه", 1.2)],
+    3: [("🧛", "ارباب تاریکی", 1.7), ("🐲", "اژدهای زنجیری", 1.8), ("😈", "دیو سرداب", 1.6)],
+}
+DUNGEON_W = [14, 36, 34, 14, 2]   # شانس درجه‌ی کمیابی غنیمت سرداب (Common..Legendary)
+
+
+def dungeon_enemy(uid, stage, ts):
+    rng = random.Random("dg:%d:%d:%d" % (uid, stage, int(ts)))
+    return rng.choice(DUNGEON_ENEMIES[min(max(stage, 1), 3)])
+
+
+def dungeon_enemy_power(u, mult):
+    # سختی دشمن هم از لول و هم از قدرت رزمی قهرمان تأثیر می‌گیره (هماهنگ با قدرت بازیکن)
+    return (level_of(u["xp"]) * 0.5 + 8 + duel_power(u) * 0.5) * mult
+
+
+def dungeon_fight_chance(uid, u, mult):
+    c = (0.55 + (duel_power(u) - dungeon_enemy_power(u, mult)) * 0.012
+         + (pet_bonus(uid, "luck") + fal_bonus(uid, "luck")) / 100)
+    return max(0.20, min(0.92, c))
+
+
+def dungeon_view(uid, stage, hp, loot, ts):
+    u = user_by_id(uid)
+    em, nm, mult = dungeon_enemy(uid, stage, ts)
+    boss = " 👑 (باس سرداب)" if stage >= 3 else ""
+    chance = int(dungeon_fight_chance(uid, u, mult) * 100)
     text = (f"🕳 سرداب — مرحله {stage}/3\n❤️ جان: {hp}   💰 غنیمت: {loot}\n\n"
-            f"یه {random.choice(ENEMIES)} جلوته! چیکار می‌کنی؟")
+            f"{em} {nm}{boss} جلوته!\n💪 قدرت دشمن: {dungeon_enemy_power(u, mult):.0f} • قدرت تو: {duel_power(u):.0f}\n"
+            f"🎯 شانس پیروزی در نبرد: {chance}٪\n\nچیکار می‌کنی؟")
     kb = Markup([[Btn("⚔️ نبرد (ریسک بالا)", f"dg:{uid}:{stage}:f"),
                   Btn("🕵️ دزدکی (امن‌تر)", f"dg:{uid}:{stage}:s")]])
     return text, kb
@@ -2163,14 +2433,15 @@ async def cmd_dungeon(update, ctx, args):
     left = cd_left(u, "last_dungeon", DUNGEON_COOLDOWN)
     if left > 0:
         return await update.message.reply_text(f"⏳ {fmt_time(left)} دیگه می‌تونی بری سرداب.")
-    hp = 100 + best_power(uid, "armor")
+    hp = 100 + best_power(uid, "armor") + level_of(u["xp"]) * 3
+    ts = time.time()
     with tx():
         set_time(uid, "last_dungeon")
         db.execute("UPDATE users SET adv_count=adv_count+1 WHERE id=?", (uid,))
         bump(uid, "adv")
         db.execute("INSERT OR REPLACE INTO dungeon_runs(user_id, stage, hp, loot, ts) VALUES(?,1,?,0,?)",
-                   (uid, hp, time.time()))
-    text, kb = dungeon_view(uid, 1, hp, 0)
+                   (uid, hp, ts))
+    text, kb = dungeon_view(uid, 1, hp, 0, ts)
     await update.message.reply_text(text, reply_markup=kb)
 
 
@@ -2181,23 +2452,34 @@ def dungeon_step(uid, stage, choice):
             return {"kind": "alert", "text": "این مرحله دیگه معتبر نیست."}
         hp, loot = run["hp"], run["loot"]
         u = user_by_id(uid)
-        scale = 1 + level_of(u["xp"]) * 0.03
-        weapon, armor = best_power(uid, "weapon"), best_power(uid, "armor")
+        lvl = level_of(u["xp"])
+        em, nm, mult = dungeon_enemy(uid, stage, run["ts"])
+        scale = 1 + lvl * 0.03
+        dscale = (1 + lvl * 0.035) * mult                     # خسارت با لول و قدرت دشمن بزرگ می‌شه (باس خطرناک‌تره)
+        armor = best_power(uid, "armor")
+        found_lines = []
         if choice == "f":
-            if random.random() < min(0.55 + weapon / 100, 0.90):
-                loot += int(random.randint(40, 90) * scale)
-                dmg, log = random.randint(5, 20), "⚔️ دشمن رو شکست دادی و غنیمت گرفتی!"
+            if random.random() < dungeon_fight_chance(uid, u, mult):
+                loot += int(random.randint(40, 90) * scale * (0.8 + 0.2 * mult))
+                dmg, log = random.randint(5, 20), f"⚔️ {em} {nm} رو شکست دادی و غنیمت گرفتی!"
+                if stage < 3 and random.random() < 0.10:
+                    key = roll_item(u, DUNGEON_W, 0.1 + race_mod(uid, "rare"))
+                    if key:
+                        found_lines.append(grant_loot_item(uid, key)[0])
             else:
-                dmg, log = random.randint(20, 45), "💥 دشمن زخمیت کرد و غنیمتی نگرفتی."
+                dmg, log = random.randint(20, 45), f"💥 {nm} زخمیت کرد و غنیمتی نگرفتی."
         else:
-            if random.random() < 0.80:
+            if random.random() < max(0.45, min(0.88, 0.85 - (mult - 1) * 0.35)):
                 loot += int(random.randint(10, 30) * scale)
                 dmg, log = random.randint(0, 8), "🕵️ بی‌صدا رد شدی و یه چیزی پیدا کردی."
             else:
-                dmg, log = random.randint(10, 25), "👀 دیدنت و بهت حمله کردن."
-        dmg = max(0, int(dmg * (1 - armor / 200 - (0.05 if u["cls"] == "warrior" else 0))))
+                dmg, log = random.randint(10, 25), f"👀 {nm} دیدت و بهت حمله کرد."
+        red = min(0.75, armor / 200 + (0.05 if u["cls"] == "warrior" else 0) + race_mod(uid, "def"))
+        dmg = max(0, int(dmg * dscale * (1 - red)))
         hp -= dmg
         log += f"\n💔 -{dmg} جان"
+        if found_lines:
+            log += "\n" + "\n".join(found_lines)
         if hp <= 0:
             if qty(uid, "potion2") > 0:
                 use_one(uid, "potion2")
@@ -2216,10 +2498,26 @@ def dungeon_step(uid, stage, choice):
             db.execute("DELETE FROM dungeon_runs WHERE user_id=?", (uid,))
             add_coins(uid, total)
             xp, note = grant_xp(uid, 40)
-            return {"kind": "end", "text": f"{log}\n\n🏆 از سرداب زنده بیرون اومدی!\n💰 جایزه: {total} سکه\n✨ +{xp} XP{note}"}
+            add_fame(uid, 8)
+            drops = []
+            luck = 0.1 + race_mod(uid, "rare")
+            for _ in range(2):
+                if random.random() < 0.5:
+                    key = roll_item(u, DUNGEON_W, luck)
+                    if key:
+                        drops.append(grant_loot_item(uid, key)[0])
+            if random.random() < 0.18:
+                relic = [k for k in ("dgn1", "dgn2") if ITEMS[k][3] <= lvl]
+                if relic:
+                    drops.append("🌟 غنیمت ویژه‌ی سرداب!\n" + grant_loot_item(uid, random.choice(relic))[0])
+            text = f"{log}\n\n🏆 از سرداب زنده بیرون اومدی!\n💰 جایزه: {total} سکه\n✨ +{xp} XP{note}"
+            if drops:
+                text += "\n\n📦 غنیمت سرداب:\n" + "\n".join(drops)
+            return {"kind": "end", "text": text}
+        ts2 = time.time()
         db.execute("UPDATE dungeon_runs SET stage=?, hp=?, loot=?, ts=? WHERE user_id=?",
-                   (stage + 1, hp, loot, time.time(), uid))
-        return {"kind": "next", "log": log, "stage": stage + 1, "hp": hp, "loot": loot}
+                   (stage + 1, hp, loot, ts2, uid))
+        return {"kind": "next", "log": log, "stage": stage + 1, "hp": hp, "loot": loot, "ts": ts2}
 
 
 async def cb_dungeon(update, ctx):
@@ -2237,7 +2535,7 @@ async def cb_dungeon(update, ctx):
     if res["kind"] == "end":
         await safe_edit(q, res["text"])
         return await send_event_sticker(ctx, q.message.chat_id, "win" if "🏆" in res["text"] else "lose", 1.0)
-    text, kb = dungeon_view(uid, res["stage"], res["hp"], res["loot"])
+    text, kb = dungeon_view(uid, res["stage"], res["hp"], res["loot"], res["ts"])
     await safe_edit(q, f"{res['log']}\n\n{text}", kb)
 
 
@@ -2273,15 +2571,18 @@ async def cb_friend(update, ctx):
     action, from_id, to_id = parts[0], int(parts[1]), int(parts[2])
     if q.from_user.id != to_id:
         return await q.answer("این درخواست برای تو نیست.", show_alert=True)
-    with tx():
-        req = db.execute("SELECT ts FROM friend_requests WHERE from_id=? AND to_id=?", (from_id, to_id)).fetchone()
-        if not req:
-            return await q.answer("این درخواست قبلاً تعیین تکلیف شده.", show_alert=True)
-        db.execute("DELETE FROM friend_requests WHERE from_id=? AND to_id=?", (from_id, to_id))
-        expired = time.time() - req["ts"] > 86400
-        if action == "friend_accept" and not expired:
-            a, b = sorted((from_id, to_id))
-            db.execute("INSERT OR IGNORE INTO friends(a, b, since) VALUES(?,?,?)", (a, b, time.time()))
+    try:
+        with tx():
+            req = db.execute("SELECT ts FROM friend_requests WHERE from_id=? AND to_id=?", (from_id, to_id)).fetchone()
+            if not req:
+                raise _Early(q.answer("این درخواست قبلاً تعیین تکلیف شده.", show_alert=True))
+            db.execute("DELETE FROM friend_requests WHERE from_id=? AND to_id=?", (from_id, to_id))
+            expired = time.time() - req["ts"] > 86400
+            if action == "friend_accept" and not expired:
+                a, b = sorted((from_id, to_id))
+                db.execute("INSERT OR IGNORE INTO friends(a, b, since) VALUES(?,?,?)", (a, b, time.time()))
+    except _Early as _e:
+        return await _e.coro
     if expired:
         await q.answer("درخواست منقضی شده بود.")
         return await safe_edit(q, "⌛ درخواست دوستی منقضی شد.")
@@ -2516,6 +2817,7 @@ def settle_season():
                 coins += 4000
             if coins:
                 add_coins(uid, coins)
+            add_fame(uid, {1: 100, 2: 60, 3: 40}.get(place, 15 if place <= 10 else 3))
             if place <= 10:
                 db.execute("INSERT OR REPLACE INTO season_results(season, place, user_id, name, pts) VALUES(?,?,?,?,?)",
                            (no, place, uid, r["name"], r["pts"]))
@@ -2759,6 +3061,8 @@ def do_forge(uid, slot):
             db.execute("INSERT INTO item_plus(user_id, item, plus, fails) VALUES(?,?,?,0) "
                        "ON CONFLICT(user_id, item) DO UPDATE SET plus=excluded.plus, fails=0", (uid, key, plus + 1))
             _, note = grant_xp(uid, 5 + plus)
+            if plus + 1 in (5, 10):
+                add_fame(uid, 10 if plus + 1 == 5 else 40)
         else:
             db.execute("INSERT INTO item_plus(user_id, item, plus, fails) VALUES(?,?,?,1) "
                        "ON CONFLICT(user_id, item) DO UPDATE SET fails=item_plus.fails+1", (uid, key, plus))
@@ -2907,6 +3211,7 @@ def market_buy(uid, lid):
                    "ON CONFLICT(user_id, item) DO UPDATE SET qty=qty+1", (uid, key))
         auto_equip(uid, key)
         db.execute("UPDATE users SET market_sales=market_sales+1 WHERE id=?", (seller,))
+        db.execute("DELETE FROM found_items WHERE user_id=? AND item=?", (seller, key))
         notify(seller, f"🏷 {u['name']} وسیله‌ی {ITEMS[key][0]} تو رو {price:,} سکه خرید!\n"
                        f"💰 +{price - fee:,} سکه به حسابت اومد (کارمزد بازار: {fee:,})")
     return True, f"{ITEMS[key][0]} رو {price:,} سکه خریدی! ✅"
@@ -3252,7 +3557,8 @@ def eggs_view(u, note=""):
         lines += ["", "🔥 توی دستگاه:"]
     for r in inc:
         ready = r["ready"] <= now
-        lines.append(f"{ITEMS[f'egg{r['tier']}'][0]} — " + ("آماده‌ی شکستن! 🐣" if ready else f"{fmt_time(r['ready'] - now)} مونده"))
+        egg_nm = ITEMS["egg%d" % r["tier"]][0]
+        lines.append(f"{egg_nm} — " + ("آماده‌ی شکستن! 🐣" if ready else f"{fmt_time(r['ready'] - now)} مونده"))
         if ready:
             kb.append([Btn("🐣 شکستن تخم", f"egg_hatch:{uid}:{r['id']}")])
     kb.append([Btn("🐾 همراه", f"pet_menu:{uid}")])
@@ -3466,11 +3772,14 @@ async def cb_pet(update, ctx):
         return await safe_edit(q, f"🕊 مطمئنی می‌خوای {sp[0]} {p['name']} ({RARITY_TAG[sp[2]]}، لول {pet_level(p['xp'])}) رو رها کنی؟\n"
                                   "این کار برگشت نداره!", kb)
     elif act == "pet_relyes" and arg.isdigit():
-        with tx():
-            p = db.execute("SELECT * FROM pets WHERE id=? AND user_id=?", (int(arg), uid)).fetchone()
-            if not p or user_by_id(uid)["active_pet"] == p["id"] or p["trip_kind"]:
-                return await q.answer("این همراه رو نمی‌شه رها کرد.", show_alert=True)
-            db.execute("DELETE FROM pets WHERE id=?", (p["id"],))
+        try:
+            with tx():
+                p = db.execute("SELECT * FROM pets WHERE id=? AND user_id=?", (int(arg), uid)).fetchone()
+                if not p or user_by_id(uid)["active_pet"] == p["id"] or p["trip_kind"]:
+                    raise _Early(q.answer("این همراه رو نمی‌شه رها کرد.", show_alert=True))
+                db.execute("DELETE FROM pets WHERE id=?", (p["id"],))
+        except _Early as _e:
+            return await _e.coro
         note = f"🕊 {p['name']} رها شد و آزاد رفت..."
         view = "list"
     elif act == "pet_eggs":
@@ -3594,6 +3903,10 @@ def settle_world(bid, killed):
             if coins:
                 add_coins(uid, coins)
             grant_xp(uid, 40 if killed else 8)
+            fp = 3
+            if killed:
+                fp = 40 + {0: 30, 1: 20, 2: 10}.get(i, 0) if r["hits"] >= 3 else 8
+            add_fame(uid, fp)
             if killed:
                 if i < 5:
                     parts.append(give_item(uid, "egg3"))
@@ -4046,6 +4359,7 @@ def pay_referrals(uid):
             return
         db.execute("UPDATE users SET refs=refs+1 WHERE id=?", (inv["id"],))
         add_coins(inv["id"], REF_REWARD)
+        add_fame(inv["id"], 10)
         egg = give_item(inv["id"], "egg1")
         notify(inv["id"], f"🎉 دوستت {u['name']} به لول ۵ رسید!\nجایزه‌ی دعوت: 💰 +{REF_REWARD:,} و {egg}\n"
                           f"📊 دعوت‌های موفق: {inv['refs'] + 1}/{REF_MAX}")
@@ -4179,7 +4493,7 @@ TIPS = [
     "با «ازدواج» (از لول ۸) ۵٪ سکه‌ی کار بیشتر می‌گیری 💍",
     "«چرخ» هر ۲۰ ساعت یه بار رایگانه 🎰",
     "مدال‌ها جایزه‌ی سکه دارن؛ «مدال‌ها» رو ببین ببین به کدوم نزدیکی 🏅",
-    "قبل از دوئل زره و سلاحت رو چک کن؛ قدرت رزمی توی پروفایله ⚔️",
+    "قبل از دوئل زره و سلاحت رو چک کن؛ قدرت رزمی توی «وضعیت قهرمان» هست ⚔️",
     "«سرداب» (از لول ۹) چالش مرحله‌ایه؛ معجون بزرگ جونت رو نجات می‌ده 🧪",
     "آیتم‌های 🟧 افسانه‌ای از رویدادها و جایزه‌های ویژه به‌دست میان",
     "توی «تالار افتخار» ببین بهترین‌های سرزمین کی‌ان 🏛",
@@ -4316,7 +4630,10 @@ async def cmd_hof(update, ctx, args):
 # ============================== تنظیم خودکار ظاهر ربات (برای جذب از دور) ==============================
 PROFILE_COMMANDS = [
     ("start", "شروع و ساخت شخصیت 🎭"), ("tutorial", "ماموریت‌های شروع و جایزه‌ها 🧭"),
-    ("help", "راهنمای کامل بازی 📖"), ("profile", "کارت قهرمان و تجهیزات 👑"),
+    ("help", "راهنمای کامل بازی 📖"), ("status", "وضعیت قهرمان (دو صفحه) 📜"), ("guide", "راهنمای الدوریا 📖"),
+    ("race", "نژاد قهرمان 🧬"), ("herocode", "کد قهرمان 🆔"), ("explore", "اکتشاف و مأموریت‌ها 🧭"),
+    ("fame", "برترین‌های شهرت 🌠"),
+    ("profilecard", "کارت تصویری قهرمان 🖼"), ("achievements", "تالار مدال‌ها و افتخارات 🏅"),
     ("work", "کار کن و سکه بگیر 🔨"), ("adventure", "ماجراجویی و غنیمت 🗺"),
     ("daily", "جایزه‌ی روزانه 🎁"), ("wheel", "چرخ شانس 🎰"), ("fal", "فال امروز 🔮"),
     ("pet", "همراه تو 🐾"), ("eggs", "تخم و جوجه‌کشی 🥚"),
@@ -4363,8 +4680,19 @@ async def setup_bot_profile(bot):
             logging.info("تنظیم %s ربات ناموفق بود: %s", name, e)
 
 
+async def _backup_job(context):
+    # SQLite backup is synchronous and short for this bot's local database.
+    backup_db()
+
+
 async def _post_init(app):
     await setup_bot_profile(app.bot)
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(_backup_job, interval=6 * 3600, first=6 * 3600,
+                                   name="database_backup")
+    else:
+        logging.warning("JobQueue unavailable; only startup database backup is enabled. "
+                        "Install python-telegram-bot[job-queue] for periodic backups.")
 
 
 # ============================== مدال‌ها 🏅 ==============================
@@ -4426,7 +4754,38 @@ ACHS = [  # (کلید، ایموجی، اسم، توضیح، آمار، هدف،
 ]
 
 
+ACHS += [
+    ("adv_z3", "🌲", "کاشف مناطق", "سه منطقه‌ی ماجراجویی رو کامل کن", "zones", 3, 1500),
+    ("adv_z6", "🗺", "فاتح نقشه", "هر ۶ منطقه‌ی ماجراجویی رو کامل کن", "zones", 6, 10000),
+    ("advb1", "🐉", "شکارچی باس منطقه", "باس یه منطقه رو شکست بده", "advboss", 1, 1500),
+    ("advb2", "👑", "سلطان باس‌ها", "۱۰ باس منطقه‌ای رو شکست بده", "advboss", 10, 8000),
+    ("advr1", "🟦", "یابنده‌ی کمیاب", "یه آیتم Rare پیدا کن", "lootbest", 3, 1000),
+    ("advr2", "🟪", "شکارچی حماسی", "یه آیتم Epic پیدا کن", "lootbest", 4, 4000),
+    ("advr3", "🟧", "چشم‌روشن افسانه‌ای", "یه آیتم Legendary پیدا کن", "lootbest", 5, 15000),
+    ("advc1", "🎁", "گنج‌گیر ماجراجو", "۲۵ صندوق توی ماجراجویی باز کن", "advchests", 25, 2500),
+    ("fame1", "🌠", "نام‌آور", "به ۴۰۰ شهرت دائمی برس", "fame", 400, 2000),
+    ("fame2", "⭐", "اسطوره‌ی شهرت", "به ۳۵۰۰ شهرت دائمی برس", "fame", 3500, 10000),
+]
+for _rk, _rv in RACES.items():
+    ACHS.append((f"race_{_rk}_a", _rv[0], f"فرزند {_rv[1]}", f"به‌عنوان {_rv[1]} ({_rv[2]}) به لول ۱۰ برس",
+                 f"racelvl_{_rk}", 10, 1500))
+    ACHS.append((f"race_{_rk}_b", _rv[0], f"سرور {_rv[1]}", f"به‌عنوان {_rv[1]} ({_rv[2]}) به لول ۲۰ برس",
+                 f"racelvl_{_rk}", 20, 6000))
+
+
 def ach_stats(u):
+    st = _ach_stats_base(u)
+    st.update({
+        "zones": db.execute("SELECT COUNT(*) FROM zone_progress WHERE user_id=? AND clears>0", (u["id"],)).fetchone()[0],
+        "advboss": u["adv_boss_kills"], "lootbest": u["loot_best"], "advchests": u["adv_chests"], "fame": u["fame"],
+    })
+    lvl = level_of(u["xp"])
+    for k in RACES:
+        st[f"racelvl_{k}"] = lvl if u["race"] == k else 0
+    return st
+
+
+def _ach_stats_base(u):
     uid = u["id"]
     bal = db.execute("SELECT amount FROM bank WHERE user_id=?", (uid,)).fetchone()
     have = owned(uid)
@@ -4467,6 +4826,7 @@ def check_achievements(uid):
                 if db.execute("INSERT OR IGNORE INTO achievements(user_id, key, ts) VALUES(?,?,?)",
                               (uid, a[0], time.time())).rowcount:
                     add_coins(uid, a[6])
+                    add_fame(uid, max(3, a[6] // 200))
                     got.append(a)
     return got
 
@@ -4512,23 +4872,40 @@ def ach_badges(uid):
     return f"{len(done)}/{len(ACHS)}  {row}".rstrip()
 
 
+def ach_tier(a):
+    """رده‌ی نمایشی مدال از روی مرحله‌ی خود دستاورد؛ فقط ظاهر است و روی جایزه اثر ندارد."""
+    m = re.search(r"(\d+)$", a[0])
+    n = int(m.group(1)) if m else 1
+    return ("🥉 برنزی" if n == 1 else "🥈 نقره‌ای" if n == 2 else "🥇 طلایی" if n == 3 else "💎 افسانه‌ای")
+
+
 @command("مدال‌ها", "مدال", "دستاوردها", "دستاورد", "achievements")
 async def cmd_achievements(update, ctx, args):
     u = get_user(update.effective_user)
     new = check_achievements(u["id"])
     done, stats = ach_done(u["id"]), ach_stats(u)
-    lines = [f"🏅 مدال‌های {u['name']}", f"✅ {len(done)} از {len(ACHS)} مدال", "━━━━━━━━━━━━━━"]
-    unlocked = [f"{a[1]} {a[2]}" for a in ACHS if a[0] in done]
-    if unlocked:
-        lines.append(" • ".join(unlocked))
+    lines = [f"🏛 <b>تالار افتخارات {html.escape(u['name'])}</b>",
+             f"🏅 مدال‌های بازشده: <b>{len(done)} از {len(ACHS)}</b>",
+             bar(len(done), len(ACHS)), "━━━━━━━━━━━━━━━━━━"]
+    if done:
+        lines.append("<b>✨ مدال‌های کسب‌شده</b>")
+        unlocked = [a for a in ACHS if a[0] in done]
+        for a in unlocked:
+            lines.append(f"{a[1]} <b>{html.escape(a[2])}</b>  <i>({ach_tier(a)})</i>")
     locked = [a for a in ACHS if a[0] not in done]
-    near = sorted(locked, key=lambda a: -min(1.0, stats[a[4]] / a[5]))[:6]
+    near = sorted(locked, key=lambda a: min(1.0, stats.get(a[4], 0) / max(1, a[5])), reverse=True)[:8]
     if near:
-        lines += ["", "🎯 نزدیک‌ترین مدال‌ها:"]
-        lines += [f"▫️ {a[1]} {a[2]} — {min(stats[a[4]], a[5]):,}/{a[5]:,}\n    {a[3]}" for a in near]
-    if len(locked) > len(near):
-        lines += ["", f"🔒 {len(locked) - len(near)} مدال دیگه هم منتظرته!"]
-    await update.message.reply_text("\n".join(lines))
+        lines += ["", "<b>🎯 مدال‌های در دسترس</b>"]
+        for a in near:
+            current = max(0, stats.get(a[4], 0))
+            progress = min(current, a[5])
+            pct = int(100 * progress / max(1, a[5]))
+            lines.append(f"🔒 {a[1]} <b>{html.escape(a[2])}</b> — {ach_tier(a)}\n   {bar(progress, a[5])} {progress:,}/{a[5]:,}  ({pct}٪)")
+    remaining = len(locked) - len(near)
+    if remaining > 0:
+        lines += ["", f"🌟 {remaining} مدال دیگر هم در تالار پنهان مانده است."]
+    lines += ["", "<i>هر مدال، نشانی از یک ماجراجویی واقعی است.</i>"]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
     if new:
         await send_ach(ctx, update.effective_chat.id, new)
 
@@ -4770,6 +5147,7 @@ def settle_boss(chat_id, killed, killer_id=None):
                 ups.append(r["name"])
             if killed:
                 db.execute("UPDATE users SET boss_kills=boss_kills+1 WHERE id=?", (r["user_id"],))
+                add_fame(r["user_id"], 12 + (8 if i == 0 else 0))
             if i < 5:
                 medal = "🥇🥈🥉🏅🏅"[i]
                 lines.append(f"{medal} {r['name']} — {r['dmg']:,} آسیب ← 💰 {coins:,}" +
@@ -4830,10 +5208,10 @@ def boss_damage_roll(u):
     if cls != "hunter" and random.random() < 0.08:
         return 0, "💨 ضربه‌ت خطا رفت!"
     base = random.randint(20, 40) + lvl * 3 + weapon * 2
-    mult = 1 + {"warrior": 0.15, "mage": 0.20, "hunter": 0.10}.get(cls, 0)
+    mult = 1 + {"warrior": 0.15, "mage": 0.20, "hunter": 0.22}.get(cls, 0)
     if cls == "alchemist":
         base += 15
-    dmg, note = int(base * mult * season_perk("boss_dmg") * (1 + (pet_bonus(u["id"], "dmg") + fal_bonus(u["id"], "dmg")) / 100)), ""
+    dmg, note = int(base * mult * season_perk("boss_dmg") * race_mod(u["id"], "dmg") * (1 + (pet_bonus(u["id"], "dmg") + fal_bonus(u["id"], "dmg")) / 100)), ""
     if random.random() < 0.10 + (0.15 if cls == "ninja" else 0) + season_perk("crit"):
         dmg, note = dmg * 2, "💥 ضربه‌ی بحرانی!"
     return dmg, note
@@ -4953,6 +5331,7 @@ async def pay_invite(ctx, chat_id):
         total = inviter["invites"] + 1
         db.execute("UPDATE users SET invites=? WHERE id=?", (total, inviter["id"]))
         add_coins(inviter["id"], INVITE_REWARD)
+        add_fame(inviter["id"], 15)
         _, note = grant_xp(inviter["id"], 100)
         key = INVITE_MILESTONES.get(total)
         if key:
@@ -5209,17 +5588,20 @@ async def cmd_guild_create(update, ctx, args):
         return await update.message.reply_text(
             "نام انجمن باید ۳ تا ۲۴ حرف (فارسی/انگلیسی/عدد) باشه.\nمثال: ساخت انجمن نگهبانان شب")
     uid = update.effective_user.id
-    with tx():
-        if guild_of(uid):
-            return await update.message.reply_text("قبل از ساخت انجمن باید از انجمن فعلی خارج بشی.")
-        if db.execute("SELECT 1 FROM guilds WHERE name=?", (name,)).fetchone():
-            return await update.message.reply_text("این نام انجمن قبلاً انتخاب شده.")
-        if GUILD_CREATE_COST and not spend(uid, GUILD_CREATE_COST):
-            return await update.message.reply_text(f"ساخت انجمن {GUILD_CREATE_COST:,} سکه هزینه داره.")
-        gid = db.execute("INSERT INTO guilds(name, owner_id, created) VALUES(?,?,?)",
-                         (name, uid, time.time())).lastrowid
-        db.execute("INSERT INTO guild_members(user_id, guild_id, role, joined) VALUES(?,?,?,?)",
-                   (uid, gid, "owner", time.time()))
+    try:
+        with tx():
+            if guild_of(uid):
+                raise _Early(update.message.reply_text("قبل از ساخت انجمن باید از انجمن فعلی خارج بشی."))
+            if db.execute("SELECT 1 FROM guilds WHERE name=?", (name,)).fetchone():
+                raise _Early(update.message.reply_text("این نام انجمن قبلاً انتخاب شده."))
+            if GUILD_CREATE_COST and not spend(uid, GUILD_CREATE_COST):
+                raise _Early(update.message.reply_text(f"ساخت انجمن {GUILD_CREATE_COST:,} سکه هزینه داره."))
+            gid = db.execute("INSERT INTO guilds(name, owner_id, created) VALUES(?,?,?)",
+                             (name, uid, time.time())).lastrowid
+            db.execute("INSERT INTO guild_members(user_id, guild_id, role, joined) VALUES(?,?,?,?)",
+                       (uid, gid, "owner", time.time()))
+    except _Early as _e:
+        return await _e.coro
     await update.message.reply_text(f"🏰 انجمن «{name}» ساخته شد!\nشناسه: {gid}\nبرای دعوت دیگران: عضویت {gid}")
 
 
@@ -5229,36 +5611,42 @@ async def cmd_guild_join(update, ctx, args):
     if gid is None:
         return await update.message.reply_text("مثال: عضویت 12")
     uid = update.effective_user.id
-    with tx():
-        if guild_of(uid):
-            return await update.message.reply_text("تو عضو یه انجمن هستی؛ اول «ترک انجمن» رو بزن.")
-        g = db.execute("SELECT * FROM guilds WHERE id=?", (gid,)).fetchone()
-        if not g:
-            return await update.message.reply_text("انجمن پیدا نشد.")
-        n = db.execute("SELECT COUNT(*) FROM guild_members WHERE guild_id=?", (gid,)).fetchone()[0]
-        if n >= GUILD_MAX_MEMBERS:
-            return await update.message.reply_text(f"ظرفیت این انجمن ({GUILD_MAX_MEMBERS} عضو) تکمیل شده.")
-        db.execute("INSERT INTO guild_members(user_id, guild_id, role, joined) VALUES(?,?,?,?)",
-                   (uid, gid, "member", time.time()))
+    try:
+        with tx():
+            if guild_of(uid):
+                raise _Early(update.message.reply_text("تو عضو یه انجمن هستی؛ اول «ترک انجمن» رو بزن."))
+            g = db.execute("SELECT * FROM guilds WHERE id=?", (gid,)).fetchone()
+            if not g:
+                raise _Early(update.message.reply_text("انجمن پیدا نشد."))
+            n = db.execute("SELECT COUNT(*) FROM guild_members WHERE guild_id=?", (gid,)).fetchone()[0]
+            if n >= GUILD_MAX_MEMBERS:
+                raise _Early(update.message.reply_text(f"ظرفیت این انجمن ({GUILD_MAX_MEMBERS} عضو) تکمیل شده."))
+            db.execute("INSERT INTO guild_members(user_id, guild_id, role, joined) VALUES(?,?,?,?)",
+                       (uid, gid, "member", time.time()))
+    except _Early as _e:
+        return await _e.coro
     await update.message.reply_text(f"🎉 به انجمن «{g['name']}» پیوستی!")
 
 
 @command("ترک انجمن", "leaveguild")
 async def cmd_guild_leave(update, ctx, args):
     uid = update.effective_user.id
-    with tx():
-        row = db.execute("SELECT * FROM guild_members WHERE user_id=?", (uid,)).fetchone()
-        if not row:
-            return await update.message.reply_text("عضو هیچ انجمنی نیستی.")
-        if row["role"] == "owner":
-            nxt = db.execute("SELECT user_id FROM guild_members WHERE guild_id=? AND user_id<>? "
-                             "ORDER BY joined LIMIT 1", (row["guild_id"], uid)).fetchone()
-            if nxt:
-                db.execute("UPDATE guild_members SET role='owner' WHERE user_id=?", (nxt["user_id"],))
-                db.execute("UPDATE guilds SET owner_id=? WHERE id=?", (nxt["user_id"], row["guild_id"]))
-            else:
-                db.execute("DELETE FROM guilds WHERE id=?", (row["guild_id"],))
-        db.execute("DELETE FROM guild_members WHERE user_id=?", (uid,))
+    try:
+        with tx():
+            row = db.execute("SELECT * FROM guild_members WHERE user_id=?", (uid,)).fetchone()
+            if not row:
+                raise _Early(update.message.reply_text("عضو هیچ انجمنی نیستی."))
+            if row["role"] == "owner":
+                nxt = db.execute("SELECT user_id FROM guild_members WHERE guild_id=? AND user_id<>? "
+                                 "ORDER BY joined LIMIT 1", (row["guild_id"], uid)).fetchone()
+                if nxt:
+                    db.execute("UPDATE guild_members SET role='owner' WHERE user_id=?", (nxt["user_id"],))
+                    db.execute("UPDATE guilds SET owner_id=? WHERE id=?", (nxt["user_id"], row["guild_id"]))
+                else:
+                    db.execute("DELETE FROM guilds WHERE id=?", (row["guild_id"],))
+            db.execute("DELETE FROM guild_members WHERE user_id=?", (uid,))
+    except _Early as _e:
+        return await _e.coro
     await update.message.reply_text("از انجمن خارج شدی.")
 
 
@@ -5387,6 +5775,1121 @@ def chat_reward(user_id, text):
                    "chat_reward_ts=? WHERE id=?", (CHAT_REWARD, day, total + CHAT_REWARD, now, user_id))
 
 
+# ============================== v11: نژاد، شهرت، غنیمت ==============================
+def race_key(uid):
+    u = user_by_id(uid)
+    return u["race"] if u and u["race"] in RACES else ""
+
+
+def race_mod(uid, key):
+    r = race_key(uid)
+    default = 1.0 if key in _RACE_MULT_KEYS else 0
+    return RACES[r][5].get(key, default) if r else default
+
+
+def fame_title(fame):
+    title, nxt = FAME_TITLES[0][1], None
+    for i, (th, name) in enumerate(FAME_TITLES):
+        if fame >= th:
+            title = name
+            nxt = FAME_TITLES[i + 1][0] if i + 1 < len(FAME_TITLES) else None
+    return title, nxt
+
+
+def add_fame(uid, pts):
+    """شهرت دائمی؛ مستقل از امتیاز فصل و بعد از پایان فصل پاک نمی‌شه."""
+    if pts <= 0:
+        return
+    r = db.execute("SELECT fame FROM users WHERE id=?", (uid,)).fetchone()
+    if not r:
+        return
+    old = r["fame"]
+    new = old + int(pts)
+    db.execute("UPDATE users SET fame=? WHERE id=?", (new, uid))
+    if fame_title(new)[0] != fame_title(old)[0]:
+        notify(uid, f"🌠 شهرتت رشد کرد! عنوان تازه: «{fame_title(new)[0]}» ({new:,} شهرت)")
+
+
+def item_tier(key):
+    return TIER_OF.get(ITEM_RARITY.get(key, "⚪"), 1)
+
+
+def rarity_label(key):
+    e, en, _fa = RARITY[item_tier(key)]
+    return f"{e} {en}"
+
+
+def sell_price(uid, key):
+    found = db.execute("SELECT 1 FROM found_items WHERE user_id=? AND item=?", (uid, key)).fetchone()
+    return int(ITEMS[key][2] * (FOUND_SELL_RATIO if found else SELL_RATIO))
+
+
+def note_found(uid, key):
+    t = item_tier(key)
+    db.execute("UPDATE users SET loot_best=MAX(loot_best, ?), rare_found=rare_found+? WHERE id=?",
+               (t, 1 if t >= 3 else 0, uid))
+
+
+def grant_loot_item(uid, key):
+    """غنیمت رو به کوله‌پشتی اضافه می‌کنه. خروجی: (متن، درجه). تکراری‌ها به سکه‌ی کم تبدیل می‌شن."""
+    cap = CONSUMABLE_MAX if ITEMS[key][1] == "misc" else 1
+    tag = rarity_label(key)
+    if qty(uid, key) < cap:
+        db.execute("INSERT INTO items(user_id, item, qty) VALUES(?,?,1) "
+                   "ON CONFLICT(user_id, item) DO UPDATE SET qty=qty+1", (uid, key))
+        if ITEMS[key][1] in SLOTS:
+            db.execute("INSERT OR IGNORE INTO found_items(user_id, item) VALUES(?,?)", (uid, key))
+            auto_equip(uid, key)
+        note_found(uid, key)
+        return f"{tag} {ITEMS[key][0]}", item_tier(key)
+    cash = max(10, min(500, int(ITEMS[key][2] * FOUND_SELL_RATIO)))
+    add_coins(uid, cash)
+    note_found(uid, key)
+    return f"{tag} {ITEMS[key][0]} (تکراری؛ {cash:,} سکه)", item_tier(key)
+
+
+LOOT_W = {1: [72, 24, 4, 0, 0], 2: [58, 32, 9.5, 0.5, 0], 3: [48, 38, 13, 1, 0],
+          4: [36, 40, 20, 3.5, 0.5], 5: [26, 40, 27, 6, 1], 6: [18, 38, 32, 10.5, 1.5]}
+
+
+def pick_tier(weights, luck):
+    w = list(weights)
+    for i in (2, 3, 4):
+        w[i] *= 1 + max(0.0, luck)
+    if sum(w) <= 0:
+        return 1
+    return random.choices(range(1, 6), w)[0]
+
+
+def loot_pool(u, tier):
+    lvl, have = level_of(u["xp"]), owned(u["id"])
+    pool = [k for k, v in ITEMS.items()
+            if k not in HIDDEN_ITEMS and item_tier(k) == tier and v[3] <= lvl and item_usable(u, k)]
+    fresh = [k for k in pool if ITEMS[k][1] == "misc" or k not in have]
+    return fresh or pool
+
+
+def roll_item(u, weights, luck):
+    """یه آیتم متناسب با لول و کلاس برمی‌گردونه (اگه درجه‌ی انتخابی خالی بود، یه درجه پایین‌تر)."""
+    t = pick_tier(weights, luck)
+    while t >= 1:
+        pool = loot_pool(u, t)
+        if pool:
+            return random.choice(pool)
+        t -= 1
+    return None
+
+
+# ============================== v11: ماجراجویی (اکتشاف مرحله‌ای) ==============================
+ADV_TTL = 1800
+ZONES = [
+    {"id": 1, "emoji": "🌲", "name": "جنگل زمزمه", "lvl": 2, "power": 4, "base": 12, "relic": "rel1",
+     "enemies": [("🐺", "گرگ جنگلی", 1.0), ("🕷", "عنکبوت سمی", 1.1), ("🧌", "گابلین راهزن", 0.9), ("🐗", "گراز وحشی", 1.0)],
+     "boss": ("🌳", "نگهبان درخت کهن", 1.5), "story": "درخت‌های کهن پچ‌پچ می‌کنن و سایه‌ها تکون می‌خورن..."},
+    {"id": 2, "emoji": "💎", "name": "غارهای کریستال", "lvl": 5, "power": 8, "base": 18, "relic": "rel2",
+     "enemies": [("🦇", "خفاش بلورین", 0.9), ("🪨", "غول سنگی", 1.2), ("🐍", "مار غار", 1.0), ("💀", "اسکلت معدنچی", 1.1)],
+     "boss": ("💠", "اژدهای بلور", 1.5), "story": "نور کریستال‌ها روی دیواره‌ها می‌رقصه..."},
+    {"id": 3, "emoji": "☣️", "name": "مرداب سمی", "lvl": 9, "power": 14, "base": 26, "relic": "rel3",
+     "enemies": [("🐸", "قورباغه‌ی غول‌آسا", 0.9), ("🧟", "مرده‌ی مردابی", 1.1), ("🪱", "کرم سمی", 1.0), ("🧙", "جادوگر مرداب", 1.3)],
+     "boss": ("🐊", "تمساح پوسیده‌ی شاه", 1.5), "story": "مه سبز روی آب‌های بدبو نشسته..."},
+    {"id": 4, "emoji": "🏔", "name": "کوهستان اژدها", "lvl": 13, "power": 21, "base": 36, "relic": "rel4",
+     "enemies": [("🦅", "عقاب تندری", 1.0), ("🧊", "غول یخی", 1.3), ("🐺", "گرگ کوهستان", 1.0), ("🔥", "سمندر آتشین", 1.2)],
+     "boss": ("🐉", "اژدهای کوهستان", 1.5), "story": "غرش اژدهایی از قله‌ها می‌پیچه..."},
+    {"id": 5, "emoji": "🏜", "name": "بیابان آتشین", "lvl": 18, "power": 29, "base": 46, "relic": "rel5",
+     "enemies": [("🦂", "عقرب غول‌پیکر", 1.0), ("🌪", "روح توفان", 1.3), ("🏺", "مومیایی پادشاه", 1.2), ("🐍", "کبرای شنی", 1.1)],
+     "boss": ("🔥", "سلطان شن و آتش", 1.5), "story": "سراب‌ها پشت ماسه‌های داغ می‌لرزن..."},
+    {"id": 6, "emoji": "🌌", "name": "ویرانه‌های شب‌ابدی", "lvl": 24, "power": 38, "base": 55, "relic": "rel6",
+     "enemies": [("👻", "شبح پادشاه", 1.1), ("🧛", "خون‌آشام باستانی", 1.3), ("🗿", "گولم تاریکی", 1.4), ("😈", "دیو سایه", 1.2)],
+     "boss": ("👁", "چشم تاریکی", 1.5), "story": "ستاره‌ای تو آسمون این ویرانه‌ها نمی‌درخشه..."},
+]
+ROUTES = {
+    "safe": {"emoji": "🌲", "name": "مسیر امن", "desc": "دشمن ضعیف‌تر • غنیمت کمتر",
+             "pw": 0.85, "rw": 0.8, "luck": 0.0, "dmg": 0.8, "w": (30, 45, 25)},
+    "risky": {"emoji": "⛰", "name": "مسیر پرخطر", "desc": "دشمن قوی‌تر • غنیمت و شانس کمیاب بیشتر",
+              "pw": 1.25, "rw": 1.5, "luck": 0.45, "dmg": 1.3, "w": (55, 20, 25)},
+    "unknown": {"emoji": "🌫", "name": "مسیر ناشناخته", "desc": "هر اتفاقی ممکنه!",
+                "pw": 1.0, "rw": 1.15, "luck": 0.2, "dmg": 1.0, "w": (35, 40, 25)},
+}
+ADV_CHEST_NAMES = {1: "📦 صندوق چوبی", 2: "🎁 صندوق نقره‌ای", 3: "💎 صندوق طلایی", 4: "👑 گنجینه‌ی کمیاب"}
+
+# رویدادها: (عنوان، توضیح، [(برچسب دکمه، [(وزن، متن، اثر)])]) — اثر: coins(ضریب)، hp(منفی=آسیب)، xp، loot(تعداد قرعه)
+ADV_EVENTS = [
+    ("🧙 پیرمرد مرموز", "پیرمردی کنار آتش نشسته و ازت می‌خواد غذات رو باهاش قسمت کنی.", [
+        ("🍞 قسمت کن", [(55, "🙏 دعات کرد و یه کیسه سکه بهت داد!", {"coins": 1.0}),
+                        (25, "✨ یه یادگاری قدیمی بهت بخشید!", {"loot": 1}),
+                        (20, "😈 پیرمرد یه جادوگر بود و نفرینت کرد!", {"hp": -14})]),
+        ("🚶 بی‌اعتنا رد شو", [(100, "از کنارش گذشتی و راهت رو ادامه دادی.", {})])]),
+    ("🌉 پل شکسته", "پل باریکی که نصفش فرو ریخته جلوته؛ اون طرفش برق چیزی دیده می‌شه.", [
+        ("🏃 بپر!", [(55, "🎯 پریدی و اون طرف یه کیسه‌ی پر از سکه پیدا کردی!", {"coins": 1.1}),
+                     (45, "💥 پات سر خورد و سقوط کردی!", {"hp": -22})]),
+        ("🔨 تعمیرش کن", [(75, "🛠 پل رو تعمیر کردی و زیرش یه گنج کوچیک بود!", {"coins": 0.4, "loot": 1, "xp": 4}),
+                          (25, "🪵 تخته‌ها روی سرت ریخت!", {"hp": -10})])]),
+    ("⛲ چشمه‌ی درخشان", "چشمه‌ای با آب نورانی وسط راهه.", [
+        ("🥤 بنوش", [(55, "💚 جونت تازه شد!", {"hp": 30}),
+                     (20, "📚 یه دانش باستانی توی ذهنت جا گرفت!", {"xp": 8}),
+                     (25, "🤢 آبش مسموم بود!", {"hp": -16})]),
+        ("🪙 سکه بنداز و آرزو کن", [(45, "🌟 آرزوت برآورده شد!", {"loot": 1}),
+                                   (55, "🫧 چیزی نشد... ولی حس خوبیه.", {})])]),
+    ("🧳 کاروان تاجر", "کاروانی پر از بار کنار جاده توقف کرده.", [
+        ("💰 معامله کن", [(65, "🤝 معامله‌ی خوبی بستی!", {"coins": 1.2}),
+                          (35, "😬 سرت کلاه رفت!", {"coins": -0.6})]),
+        ("🗡 غارتش کن", [(45, "😈 کاروان رو غارت کردی!", {"coins": 2.0, "loot": 1}),
+                         (55, "🛡 محافظ‌ها گرفتنت و حسابی زدنت!", {"hp": -28})])]),
+    ("🗿 مجسمه‌ی باستانی", "مجسمه‌ای با حکاکی‌های عجیب وسط راه ایستاده.", [
+        ("🔍 بررسی کن", [(35, "🗝 حکاکی‌ها محل یه گنج پنهان رو نشونت داد!", {"loot": 1, "xp": 5}),
+                         (35, "📜 یه رمز قدیمی رو یاد گرفتی.", {"xp": 10}),
+                         (30, "⚡ تله‌ی جادویی فعال شد!", {"hp": -20})]),
+        ("🙏 احترام بذار", [(70, "🕊 آرامش گرفتی و زخمات بهتر شد.", {"hp": 15, "xp": 4}),
+                            (30, "🌫 چیزی نشد.", {})])]),
+    ("🐾 حیوان زخمی", "حیوون زخمی‌ای کنار راه ناله می‌کنه.", [
+        ("🩹 درمانش کن", [(65, "🥹 ازت تشکر کرد و تا یه گنج راهنماییت کرد!", {"loot": 1}),
+                          (35, "🐾 دردش زیاد بود و گازت گرفت!", {"hp": -10})]),
+        ("🍖 شکارش کن", [(100, "🥩 گوشتش رو توی بازار نزدیک فروختی.", {"coins": 0.6})])]),
+    ("🌫 مه مرموز", "مه غلیظی جلوی راهه و صداهایی ازش می‌آد.", [
+        ("🧭 وارد مه شو", [(40, "✨ وسط مه یه صندوق کهن پیدا کردی!", {"loot": 2}),
+                           (30, "👻 ارواح سرگردان ازت باج گرفتن!", {"coins": -0.8}),
+                           (30, "🌀 گم شدی و خسته برگشتی.", {"hp": -12})]),
+        ("↩️ دور بزن", [(100, "با احتیاط دور زدی و سالم موندی.", {"xp": 2})])]),
+    ("🏚 کلبه‌ی متروکه", "کلبه‌ی نیمه‌ویرونی با در نیمه‌باز.", [
+        ("🚪 بگرد", [(50, "🧰 توی انبار یه چیز به‌دردبخور پیدا کردی!", {"loot": 1, "coins": 0.3}),
+                     (25, "🕷 لونه‌ی عنکبوت‌ها بود!", {"hp": -15}),
+                     (25, "🪙 چند سکه‌ی کهنه پیدا کردی.", {"coins": 0.7})]),
+        ("🔥 شب رو همین‌جا بمون", [(80, "😴 استراحت کردی و جونت برگشت.", {"hp": 25}),
+                                   (20, "🌙 نصفه‌شب غافلگیر شدی!", {"hp": -14})])]),
+]
+
+
+def adv_load(uid):
+    r = db.execute("SELECT * FROM adventure_runs WHERE user_id=?", (uid,)).fetchone()
+    if not r:
+        return None
+    run = dict(r)
+    run["loot"] = json.loads(run["loot"] or "[]")
+    run["stats"] = json.loads(run["stats"] or "{}")
+    run["node"] = json.loads(run["node"]) if run["node"] else {}
+    return run
+
+
+def adv_save(run):
+    db.execute("UPDATE adventure_runs SET zone=?, step=?, hp=?, max_hp=?, coins=?, xp=?, phase=?, node=?, loot=?, "
+               "stats=?, ts=? WHERE user_id=?",
+               (run["zone"], run["step"], run["hp"], run["max_hp"], run["coins"], run["xp"], run["phase"],
+                json.dumps(run["node"], ensure_ascii=False), json.dumps(run["loot"]),
+                json.dumps(run["stats"], ensure_ascii=False), run["ts"], run["user_id"]))
+
+
+def adv_zone_of(run):
+    return ZONES[run["zone"] - 1]
+
+
+def adv_route_of(run):
+    return ROUTES.get(run["node"].get("route", "unknown"), ROUTES["unknown"])
+
+
+def adv_win_chance(uid, u, enemy_power, extra=0.0):
+    c = (0.55 + (duel_power(u) - enemy_power) * 0.012 + race_mod(uid, "adv_win")
+         + (pet_bonus(uid, "luck") + fal_bonus(uid, "luck")) / 100 + extra)
+    return max(0.15, min(0.92, c))
+
+
+def adv_dmg(uid, u, zone, raw, mult=1.0):
+    armor = best_power(uid, "armor")
+    red = min(0.75, armor / 200 + (0.05 if u["cls"] == "warrior" else 0) + race_mod(uid, "def")
+              + pet_bonus(uid, "defense") / 100)
+    return max(0, int(raw * (1 + (zone["id"] - 1) * 0.3) * mult * (1 - red)))
+
+
+def adv_luck(uid, route_luck, extra=0.0):
+    return route_luck + race_mod(uid, "rare") + extra
+
+
+def adv_roll(run, u, zone, luck, item_bias=0.22):
+    """یه قرعه‌ی غنیمت: آیتم متناسب با لول/کلاس یا سکه. متن نتیجه رو برمی‌گردونه."""
+    if random.random() < item_bias:
+        key = roll_item(u, LOOT_W[zone["id"]], luck)
+        if key:
+            run["loot"].append(key)
+            return f"🎁 {rarity_label(key)} {ITEMS[key][0]}"
+    amt = int(zone["base"] * random.uniform(0.4, 1.0))
+    run["coins"] += amt
+    return f"💰 +{amt:,} سکه"
+
+
+def adv_apply(run, u, zone, eff):
+    """اثر یه رویداد/نتیجه رو روی سفر اعمال می‌کنه و خطوط گزارش رو برمی‌گردونه."""
+    uid = u["id"]
+    route = adv_route_of(run)
+    lines = []
+    if "coins" in eff:
+        amt = int(zone["base"] * eff["coins"] * route["rw"] * random.uniform(0.85, 1.15))
+        if amt < 0:
+            amt = -min(run["coins"], -amt)
+        run["coins"] += amt
+        if amt:
+            lines.append(f"💰 {amt:+,} سکه")
+    if "hp" in eff:
+        if eff["hp"] < 0:
+            d = adv_dmg(uid, u, zone, -eff["hp"], route["dmg"])
+            run["hp"] -= d
+            lines.append(f"💔 -{d} جان")
+        else:
+            heal = min(eff["hp"], run["max_hp"] - run["hp"])
+            run["hp"] += heal
+            lines.append(f"💚 +{heal} جان")
+    if "xp" in eff:
+        run["xp"] += eff["xp"]
+        lines.append(f"✨ +{eff['xp']} XP")
+    for _ in range(eff.get("loot", 0)):
+        lines.append(adv_roll(run, u, zone, adv_luck(uid, route["luck"]), 0.35))
+    return lines
+
+
+def adv_make_node(uid, u, zone, route_key):
+    r = ROUTES[route_key]
+    kind = random.choices(["enemy", "event", "chest"], r["w"])[0]
+    node = {"route": route_key, "kind": kind}
+    if route_key == "unknown" and random.random() < 0.3:
+        kind = node["kind"] = random.choice(["enemy", "chest"])
+        node["wild"] = True
+    if kind == "enemy":
+        em, nm, mult = random.choice(zone["enemies"])
+        elite_p = 0.10 + (0.15 if route_key == "risky" else 0.05 if route_key == "unknown" else 0)
+        elite = random.random() < elite_p or (node.get("wild") and random.random() < 0.5)
+        node.update(emoji=em, name=nm, elite=bool(elite),
+                    power=round(zone["power"] * mult * r["pw"] * (1.4 if elite else 1.0), 1))
+    elif kind == "event":
+        node["ev"] = random.randrange(len(ADV_EVENTS))
+    else:
+        w = [60, 28, 10 + int(10 * r["luck"]), 2 + int(5 * r["luck"])]
+        if node.get("wild"):
+            w = [30, 30, 30, 10]
+        node["tier"] = random.choices([1, 2, 3, 4], w)[0]
+    return node
+
+
+def adv_make_final(zone):
+    if random.random() < 0.6:
+        em, nm, mult = zone["boss"]
+        return {"route": "unknown", "kind": "boss", "emoji": em, "name": nm, "power": round(zone["power"] * mult, 1)}
+    return {"route": "unknown", "kind": "vault"}
+
+
+def adv_hp_bar(run):
+    return f"❤️ {max(0, run['hp'])}/{run['max_hp']} {bar(max(0, run['hp']), run['max_hp'], 8)}"
+
+
+def adv_zone_menu(u):
+    uid, lvl = u["id"], level_of(u["xp"])
+    left = cd_left(u, "last_adv", ADVENTURE_COOLDOWN)
+    prog = {r["zone"]: r for r in db.execute("SELECT * FROM zone_progress WHERE user_id=?", (uid,))}
+    lines = ["🗺 ماجراجویی — اکتشاف و غنیمت", "━━━━━━━━━━━━━━",
+             "هر سفر: ۳ برخورد (با انتخاب مسیر) + مرحله‌ی نهایی (باس منطقه یا گنجینه).",
+             "جان محدوده؛ اگه بمیری غنیمت سفر از دست می‌ره، ولی هر لحظه می‌تونی با غنیمتت برگردی.", ""]
+    if left > 0:
+        lines += [f"⏳ سفر بعدی: {fmt_time(left)} دیگه", ""]
+    rows = []
+    for z in ZONES:
+        p = prog.get(z["id"])
+        mark = f" ✅×{p['clears']}" if p and p["clears"] else ""
+        if lvl >= z["lvl"] or is_admin(uid):
+            lines.append(f"{z['emoji']} {z['name']} — لول {z['lvl']}+ {'⭐' * z['id']}{mark}")
+            rows.append([Btn(f"{z['emoji']} {z['name']}", f"ad:{uid}:z:{z['id']}")])
+        else:
+            lines.append(f"🔒 {z['name']} — با لول {z['lvl']} باز می‌شه")
+    lines += ["", "🧭 «اکتشاف» = مأموریت‌های منطقه‌ای و پاداش‌هاشون"]
+    return "\n".join(lines), Markup(rows)
+
+
+def adv_view(run, u):
+    zone = adv_zone_of(run)
+    node = run["node"]
+    head = (f"{zone['emoji']} {zone['name']} — مرحله {run['step']}/4\n{adv_hp_bar(run)}\n"
+            f"💰 غنیمت: {run['coins']:,}   🎁 آیتم: {len(run['loot'])}")
+    last = run["stats"].get("last", "")
+    if last:
+        head += "\n━━━━━━━━━━━━━━\n" + last
+    uid = run["user_id"]
+    head += "\n━━━━━━━━━━━━━━\n"
+    rows = []
+    if run["phase"] == "route":
+        text = head + f"📍 {zone['story']}\nکدوم مسیر رو انتخاب می‌کنی؟\n"
+        for k, r in ROUTES.items():
+            text += f"\n{r['emoji']} {r['name']}: {r['desc']}"
+            rows.append([Btn(f"{r['emoji']} {r['name']}", f"ad:{uid}:r:{k}")])
+        rows.append([Btn("🏳 بازگشت با غنیمت", f"ad:{uid}:q:x")])
+    elif node.get("kind") == "enemy":
+        ch = int(adv_win_chance(uid, u, node["power"]) * 100)
+        tag = " ⭐ نخبه" if node["elite"] else ""
+        text = (head + f"⚔️ {node['emoji']} {node['name']}{tag} سر راهته!\n💪 قدرت دشمن: {node['power']:.0f} • قدرت تو: {duel_power(u):.0f}\n"
+                f"🎯 شانس پیروزی در نبرد: {ch}٪")
+        rows = [[Btn("⚔️ نبرد", f"ad:{uid}:n:f"), Btn("🕵️ دزدکی", f"ad:{uid}:n:s")],
+                [Btn("🏃 فرار", f"ad:{uid}:n:x")]]
+    elif node.get("kind") == "event":
+        t, d, choices = ADV_EVENTS[node["ev"]]
+        text = head + f"{t}\n{d}"
+        rows = [[Btn(lb, f"ad:{uid}:e:{i}")] for i, (lb, _o) in enumerate(choices)]
+    elif node.get("kind") == "chest":
+        text = (head + f"{ADV_CHEST_NAMES[node['tier']]} پیدا کردی!\n"
+                "🔓 باز کردن با احتیاط امنه؛ شکستنش پرخطره ولی غنیمت بهتری داره.")
+        rows = [[Btn("🔓 با احتیاط باز کن", f"ad:{uid}:c:o"), Btn("🔨 بشکن", f"ad:{uid}:c:b")],
+                [Btn("↪️ بی‌خیالش", f"ad:{uid}:c:x")]]
+    elif node.get("kind") == "boss":
+        ch = int(adv_win_chance(uid, u, node["power"]) * 100)
+        text = (head + f"👑 باس منطقه: {node['emoji']} {node['name']}!\n💪 قدرت: {node['power']:.0f} • قدرت تو: {duel_power(u):.0f}\n"
+                f"🎯 شانس پیروزی: {ch}٪ (تاکتیکی: {max(15, ch - 8)}٪ با آسیب کمتر)")
+        rows = [[Btn("⚔️ نبرد تمام‌عیار", f"ad:{uid}:b:a"), Btn("🛡 تاکتیکی", f"ad:{uid}:b:t")],
+                [Btn("🏳 بازگشت با غنیمت", f"ad:{uid}:q:x")]]
+    else:
+        text = head + "🏛 به یه گنجینه‌ی باستانی رسیدی! سنگ‌های قفل‌شده‌ی در رو چطور باز می‌کنی؟"
+        rows = [[Btn("🗝 باز کن", f"ad:{uid}:v:o"), Btn("🔨 قفل رو بشکن (ریسک)", f"ad:{uid}:v:p")],
+                [Btn("🏳 بازگشت با غنیمت", f"ad:{uid}:q:x")]]
+    return text, Markup(rows)
+
+
+def adv_start(uid, u, zone_id):
+    try:
+        zid = int(zone_id)
+    except ValueError:
+        return {"kind": "alert", "text": "منطقه نامعتبره."}
+    if not 1 <= zid <= len(ZONES):
+        return {"kind": "alert", "text": "منطقه نامعتبره."}
+    zone = ZONES[zid - 1]
+    if level_of(u["xp"]) < zone["lvl"] and not is_admin(uid):
+        return {"kind": "alert", "text": f"این منطقه از لول {zone['lvl']} باز می‌شه."}
+    old = adv_load(uid)
+    if old and time.time() - old["ts"] <= ADV_TTL:
+        text, kb = adv_view(old, u)
+        return {"kind": "view", "text": "🗺 یه سفر نیمه‌کاره داری؛ ادامه بده:\n\n" + text, "kb": kb}
+    if old:
+        db.execute("DELETE FROM adventure_runs WHERE user_id=?", (uid,))
+    left = cd_left(u, "last_adv", ADVENTURE_COOLDOWN)
+    if left > 0:
+        return {"kind": "alert", "text": f"⏳ {fmt_time(left)} دیگه می‌تونی بری ماجراجویی."}
+    max_hp = 90 + level_of(u["xp"]) * 3 + best_power(uid, "armor")
+    set_time(uid, "last_adv")
+    db.execute("INSERT INTO adventure_runs(user_id, zone, step, hp, max_hp, phase, ts) VALUES(?,?,1,?,?,'route',?)",
+               (uid, zid, max_hp, max_hp, time.time()))
+    run = adv_load(uid)
+    text, kb = adv_view(run, u)
+    return {"kind": "view", "text": text, "kb": kb}
+
+
+def adv_revive(uid, u, run):
+    """اگه جان تموم شده، معجون مصرف می‌کنه. متن برمی‌گردونه یا None (مرگ قطعی)."""
+    if run["hp"] > 0:
+        return ""
+    if qty(uid, "potion2") > 0:
+        use_one(uid, "potion2")
+        run["hp"] = min(run["max_hp"], 75 if u["cls"] == "alchemist" else 60)
+        return f"\n🧪✨ معجون بزرگ خوردی و برگشتی! (جان: {run['hp']})"
+    if qty(uid, "potion") > 0:
+        use_one(uid, "potion")
+        run["hp"] = min(run["max_hp"], 40 if u["cls"] == "alchemist" else 25)
+        return f"\n🧪 معجون خوردی و از مرگ نجات پیدا کردی! (جان: {run['hp']})"
+    return None
+
+
+def adv_finish(uid, u, run, outcome, chat_id):
+    """outcome: complete | retreat | defeat. غنیمت رو تحویل می‌ده و گزارش کامل سفر رو می‌سازه."""
+    zone = adv_zone_of(run)
+    zid = zone["id"]
+    st = run["stats"]
+    db.execute("DELETE FROM adventure_runs WHERE user_id=?", (uid,))
+    lines = [f"{zone['emoji']} گزارش سفر به {zone['name']}", "━━━━━━━━━━━━━━"]
+    best_tier = 0
+    if outcome == "defeat":
+        penalty = min(u["coins"], int(zone["base"] * 1.5))
+        add_coins(uid, -penalty)
+        xp, note = grant_xp(uid, 3 + zid)
+        lines += ["💀 جانت تموم شد و غنیمت سفر از دست رفت.",
+                  f"💸 -{penalty:,} سکه خسارت", f"✨ +{xp} XP{note}",
+                  "💡 معجون و زره بیشتر، شانس زنده‌موندنت رو بالا می‌بره."]
+    else:
+        mult = (reward_mult(uid) * season_perk("adv_coins") * race_mod(uid, "adv_loot")
+                * (1 + (pet_bonus(uid, "loot") + fal_bonus(uid, "loot")) / 100))
+        coins = int(run["coins"] * mult)
+        add_coins(uid, coins)
+        base_xp = 8 + 4 * zid + st.get("kills", 0) * 3 + (zid * 6 if st.get("boss") else 0) + run["xp"]
+        xp, note = grant_xp(uid, base_xp)
+        lines.append(f"{'🏆 سفر کامل شد!' if outcome == 'complete' else '🏳 با غنیمت برگشتی.'}")
+        lines.append(f"⚔️ دشمن شکست‌خورده: {st.get('kills', 0)}" + (f" (⭐ نخبه: {st['elites']})" if st.get("elites") else "")
+                     + f" • 🎲 رویداد: {st.get('events', 0)} • 📦 صندوق: {st.get('chests', 0)}")
+        if st.get("boss"):
+            lines.append("👑 باس منطقه رو شکست دادی!")
+        lines.append(f"💰 +{coins:,} سکه   ✨ +{xp} XP{note}")
+        found = []
+        for key in run["loot"]:
+            text, t = grant_loot_item(uid, key)
+            best_tier = max(best_tier, t)
+            found.append(text)
+            if t >= 4:
+                found.append("   🌟✨ یه یافته‌ی " + ("افسانه‌ای" if t == 5 else "حماسی") + " نصیبت شد!")
+        if found:
+            lines += ["", "🎁 غنیمت‌ها:"] + found
+        if outcome == "complete":
+            row = db.execute("SELECT clears, boss_kills FROM zone_progress WHERE user_id=? AND zone=?", (uid, zid)).fetchone()
+            first_clear = not row or row["clears"] == 0
+            first_boss = st.get("boss") and (not row or row["boss_kills"] == 0)
+            db.execute("INSERT INTO zone_progress(user_id, zone, clears, boss_kills) VALUES(?,?,1,?) "
+                       "ON CONFLICT(user_id, zone) DO UPDATE SET clears=clears+1, boss_kills=boss_kills+?",
+                       (uid, zid, 1 if st.get("boss") else 0, 1 if st.get("boss") else 0))
+            fame = zid + (zid * 5 if st.get("boss") else 0)
+            extra = []
+            if first_clear:
+                add_coins(uid, zid * 400)
+                fame += zid * 10
+                extra.append(f"🧭 اولین اکتشاف کامل {zone['name']}: +{zid * 400:,} سکه")
+            if first_boss:
+                add_coins(uid, zid * 800)
+                fame += zid * 15
+                extra.append(f"👑 اولین باس {zone['name']}: +{zid * 800:,} سکه")
+            add_fame(uid, fame)
+            lines += [""] + extra + [f"🌠 +{fame} شهرت"]
+        if st.get("boss"):
+            db.execute("UPDATE users SET adv_boss_kills=adv_boss_kills+1 WHERE id=?", (uid,))
+    if st.get("chests"):
+        db.execute("UPDATE users SET adv_chests=adv_chests+? WHERE id=?", (st["chests"], uid))
+    db.execute("UPDATE users SET adv_count=adv_count+1 WHERE id=?", (uid,))
+    bump(uid, "adv")
+    chat_score(chat_id, 1 if outcome == "defeat" else 3 + zid)
+    return {"kind": "end", "text": "\n".join(lines), "tier": best_tier, "outcome": outcome}
+
+
+def adv_after_node(uid, u, run, log, chat_id):
+    """بعد از حل یه گره: مرگ؟ مرحله‌ی بعد؟ پایان؟"""
+    rv = adv_revive(uid, u, run)
+    if rv is None:
+        run["stats"]["last"] = log
+        return adv_finish(uid, u, run, "defeat", chat_id)
+    log += rv
+    zone = adv_zone_of(run)
+    run["stats"]["last"] = log
+    if run["step"] >= 4:
+        return adv_finish(uid, u, run, "complete" if run["stats"].get("done_final") else "retreat", chat_id)
+    run["step"] += 1
+    if run["step"] == 4:
+        run["phase"], run["node"] = "final", adv_make_final(zone)
+    else:
+        run["phase"], run["node"] = "route", {}
+    run["ts"] = time.time()
+    adv_save(run)
+    text, kb = adv_view(run, u)
+    return {"kind": "view", "text": text, "kb": kb}
+
+
+def adv_resolve_enemy(uid, u, run, zone, arg):
+    node, route = run["node"], adv_route_of(run)
+    st = run["stats"]
+    base, rw = zone["base"], route["rw"]
+    elite = node.get("elite")
+    name = f"{node['emoji']} {node['name']}"
+    luck = adv_luck(uid, route["luck"], 0.3 if elite else 0)
+    if arg == "f":
+        if random.random() < adv_win_chance(uid, u, node["power"]):
+            coins = int(base * random.uniform(0.6, 1.3) * rw * (1.7 if elite else 1.0))
+            run["coins"] += coins
+            run["xp"] += 3 + zone["id"] + (3 if elite else 0)
+            st["kills"] = st.get("kills", 0) + 1
+            if elite:
+                st["elites"] = st.get("elites", 0) + 1
+            d = adv_dmg(uid, u, zone, random.randint(2, 9), route["dmg"])
+            run["hp"] -= d
+            log = f"⚔️ {name} رو شکست دادی!\n💰 +{coins:,} سکه • 💔 -{d} جان"
+            if random.random() < (0.75 if elite else 0.30):
+                log += "\n" + adv_roll(run, u, zone, luck, 0.5)
+        else:
+            d = adv_dmg(uid, u, zone, random.randint(15, 32) * (1.3 if elite else 1.0), route["dmg"])
+            run["hp"] -= d
+            log = f"💥 {name} شکستت داد و غنیمتی نصیبت نشد.\n💔 -{d} جان"
+    elif arg == "s":
+        ratio = node["power"] / max(1.0, zone["power"])
+        ch = max(0.4, min(0.9, 0.85 - (ratio - 1) * 0.4 + race_mod(uid, "adv_win")))
+        if random.random() < ch:
+            coins = int(base * random.uniform(0.25, 0.5) * rw)
+            run["coins"] += coins
+            run["xp"] += 1
+            d = adv_dmg(uid, u, zone, random.randint(0, 4), route["dmg"])
+            run["hp"] -= d
+            log = f"🕵️ بی‌صدا از کنار {name} رد شدی و یه چیزی پیدا کردی.\n💰 +{coins:,} سکه" + (f" • 💔 -{d} جان" if d else "")
+            if random.random() < 0.15:
+                log += "\n" + adv_roll(run, u, zone, luck, 0.3)
+        else:
+            d = adv_dmg(uid, u, zone, random.randint(8, 20), route["dmg"])
+            run["hp"] -= d
+            log = f"👀 {name} دیدت و غافلگیرت کرد!\n💔 -{d} جان"
+    else:
+        if random.random() < 0.2:
+            d = adv_dmg(uid, u, zone, random.randint(4, 10), route["dmg"])
+            run["hp"] -= d
+            log = f"🏃 فرار کردی ولی {name} ضربه‌ای بهت زد.\n💔 -{d} جان"
+        else:
+            log = f"🏃 از دست {name} سالم فرار کردی."
+    return log
+
+
+def adv_resolve_chest(uid, u, run, zone, arg):
+    node, route = run["node"], adv_route_of(run)
+    st = run["stats"]
+    tier = node["tier"]
+    name = ADV_CHEST_NAMES[tier]
+    if arg == "x":
+        return f"↪️ {name} رو جا گذاشتی."
+    risky = arg == "b"
+    st["chests"] = st.get("chests", 0) + 1
+    lines = []
+    if random.random() < (0.30 if risky else 0.10):
+        d = adv_dmg(uid, u, zone, random.randint(14, 28) if risky else random.randint(6, 14), route["dmg"])
+        run["hp"] -= d
+        lines.append(f"💣 تله فعال شد! 💔 -{d} جان")
+    coins = int(zone["base"] * (0.6 + 0.5 * tier) * random.uniform(0.8, 1.2) * route["rw"] * (1.3 if risky else 1.0))
+    run["coins"] += coins
+    lines.append(f"💰 +{coins:,} سکه")
+    luck = adv_luck(uid, route["luck"], 0.2 if risky else 0)
+    for _ in range(tier + (1 if risky else 0)):
+        lines.append(adv_roll(run, u, zone, luck, 0.30))
+    return f"{name} باز شد!\n" + "\n".join(lines)
+
+
+def adv_resolve_final(uid, u, run, zone, act, arg):
+    node, st = run["node"], run["stats"]
+    luck = adv_luck(uid, 0.15)
+    if act == "b":
+        extra = -0.08 if arg == "t" else 0.0
+        ch = adv_win_chance(uid, u, node["power"], extra)
+        name = f"{node['emoji']} {node['name']}"
+        if random.random() < ch:
+            coins = int(zone["base"] * random.uniform(2.8, 3.6))
+            run["coins"] += coins
+            run["xp"] += 10 + zone["id"] * 5
+            st["boss"] = 1
+            st["done_final"] = 1
+            d = adv_dmg(uid, u, zone, random.randint(8, 18) * (0.6 if arg == "t" else 1.0))
+            run["hp"] -= d
+            lines = [f"👑 {name} رو شکست دادی!", f"💰 +{coins:,} سکه • 💔 -{d} جان"]
+            for _ in range(2):
+                lines.append(adv_roll(run, u, zone, luck + 0.15, 0.4))
+            if random.random() < min(0.35, 0.18 + luck / 10):
+                run["loot"].append(zone["relic"])
+                lines.append(f"🌟 غنیمت ویژه‌ی منطقه: {rarity_label(zone['relic'])} {ITEMS[zone['relic']][0]}")
+            return "\n".join(lines)
+        d = adv_dmg(uid, u, zone, random.randint(28, 50) * (0.6 if arg == "t" else 1.0))
+        run["hp"] -= d
+        run["coins"] = int(run["coins"] * 0.6)
+        return f"💥 {name} خیلی قوی بود و عقب‌نشینی کردی!\n💔 -{d} جان • 💸 ۴۰٪ غنیمت پولی از دست رفت"
+    # گنجینه
+    st["done_final"] = 1
+    st["chests"] = st.get("chests", 0) + 1
+    pick = arg == "p"
+    lines = ["🏛 گنجینه‌ی باستانی باز شد!"]
+    if pick and random.random() < 0.25:
+        d = adv_dmg(uid, u, zone, random.randint(14, 30))
+        run["hp"] -= d
+        lines.append(f"💣 تله‌ی قفل فعال شد! 💔 -{d} جان")
+    coins = int(zone["base"] * random.uniform(1.8, 2.6) * (1.4 if pick else 1.0))
+    run["coins"] += coins
+    lines.append(f"💰 +{coins:,} سکه")
+    for _ in range(3 if pick else 2):
+        lines.append(adv_roll(run, u, zone, luck + (0.2 if pick else 0.1), 0.35))
+    return "\n".join(lines)
+
+
+def adv_action(uid, act, arg, chat_id):
+    with tx():
+        u = user_by_id(uid)
+        if act == "z":
+            return adv_start(uid, u, arg)
+        run = adv_load(uid)
+        if not run:
+            return {"kind": "alert", "text": "سفر فعالی نداری؛ «ماجراجویی» رو بزن."}
+        if time.time() - run["ts"] > ADV_TTL:
+            db.execute("DELETE FROM adventure_runs WHERE user_id=?", (uid,))
+            return {"kind": "alert", "text": "این سفر منقضی شد؛ دوباره «ماجراجویی» رو بزن."}
+        zone = adv_zone_of(run)
+        phase, node = run["phase"], run["node"]
+        if act == "q" and phase in ("route", "final"):
+            return adv_finish(uid, u, run, "retreat", chat_id)
+        if act == "r" and phase == "route" and arg in ROUTES:
+            run["node"] = adv_make_node(uid, u, zone, arg)
+            run["phase"] = "node"
+            run["stats"]["last"] = ""
+            run["ts"] = time.time()
+            adv_save(run)
+            text, kb = adv_view(run, u)
+            return {"kind": "view", "text": text, "kb": kb}
+        if phase == "node" and act == "n" and node.get("kind") == "enemy" and arg in ("f", "s", "x"):
+            log = adv_resolve_enemy(uid, u, run, zone, arg)
+        elif phase == "node" and act == "e" and node.get("kind") == "event" and arg.isdigit() \
+                and int(arg) < len(ADV_EVENTS[node["ev"]][2]):
+            title, _d, choices = ADV_EVENTS[node["ev"]]
+            outs = choices[int(arg)][1]
+            _w, text_o, eff = random.choices(outs, [o[0] for o in outs])[0]
+            run["stats"]["events"] = run["stats"].get("events", 0) + 1
+            lines = adv_apply(run, u, zone, eff)
+            log = f"{title}\n{text_o}" + ("\n" + "\n".join(lines) if lines else "")
+        elif phase == "node" and act == "c" and node.get("kind") == "chest" and arg in ("o", "b", "x"):
+            log = adv_resolve_chest(uid, u, run, zone, arg)
+        elif phase == "final" and act in ("b", "v") and node.get("kind") == ("boss" if act == "b" else "vault") \
+                and arg in ("a", "t", "o", "p"):
+            log = adv_resolve_final(uid, u, run, zone, act, arg)
+            run["step"] = 4
+        else:
+            return {"kind": "alert", "text": "این دکمه دیگه معتبر نیست."}
+        return adv_after_node(uid, u, run, log, chat_id)
+
+
+@command("ماجراجویی", "adventure", level=2)
+async def cmd_adventure(update, ctx, args):
+    u = get_user(update.effective_user)
+    uid = u["id"]
+    run = adv_load(uid)
+    if run and time.time() - run["ts"] <= ADV_TTL:
+        text, kb = adv_view(run, u)
+        return await update.message.reply_text("🗺 سفر فعلیت:\n\n" + text, reply_markup=kb)
+    if run:
+        with tx():
+            db.execute("DELETE FROM adventure_runs WHERE user_id=?", (uid,))
+    text, kb = adv_zone_menu(u)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def cb_adventure(update, ctx):
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) < 3 or not parts[1].isdigit():
+        return await q.answer()
+    uid = int(parts[1])
+    if q.from_user.id != uid:
+        return await q.answer("این سفر مال تو نیست 😅", show_alert=True)
+    res = adv_action(uid, parts[2], parts[3] if len(parts) > 3 else "", q.message.chat_id)
+    if res["kind"] == "alert":
+        return await q.answer(res["text"], show_alert=True)
+    await q.answer()
+    await safe_edit(q, res["text"], res.get("kb"))
+    if res["kind"] == "end":
+        if res.get("tier", 0) >= 4:
+            await send_event_sticker(ctx, q.message.chat_id, "bosswin", 1.0)
+        elif res["outcome"] == "defeat":
+            await send_event_sticker(ctx, q.message.chat_id, "lose", 1.0)
+        elif res["outcome"] == "complete":
+            await send_event_sticker(ctx, q.message.chat_id, "win", 0.6)
+
+
+@command("اکتشاف", "explore")
+async def cmd_explore(update, ctx, args):
+    u = get_user(update.effective_user)
+    prog = {r["zone"]: r for r in db.execute("SELECT * FROM zone_progress WHERE user_id=?", (u["id"],))}
+    lvl = level_of(u["xp"])
+    lines = ["🧭 مأموریت‌های اکتشافی", "━━━━━━━━━━━━━━",
+             "اولین اکتشاف کامل هر منطقه و اولین شکست باس منطقه پاداش یک‌باره‌ی سکه و شهرت داره:", ""]
+    done = 0
+    for z in ZONES:
+        p = prog.get(z["id"])
+        c_ok = bool(p and p["clears"])
+        b_ok = bool(p and p["boss_kills"])
+        done += c_ok + b_ok
+        if lvl < z["lvl"] and not is_admin(u["id"]):
+            lines.append(f"🔒 {z['name']} — لول {z['lvl']}")
+            continue
+        lines.append(f"{z['emoji']} {z['name']}\n   {'✅' if c_ok else '⬜'} اکتشاف کامل: +{z['id'] * 400:,} سکه، +{z['id'] * 10} شهرت\n"
+                     f"   {'✅' if b_ok else '⬜'} باس {z['boss'][0]} {z['boss'][1]}: +{z['id'] * 800:,} سکه، +{z['id'] * 15} شهرت\n"
+                     f"   🎁 غنیمت ویژه‌ی باس: {ITEMS[z['relic']][0]}")
+    lines += ["", f"📈 پیشرفت: {done}/{len(ZONES) * 2}  {bar(done, len(ZONES) * 2)}"]
+    await update.message.reply_text("\n".join(lines))
+
+
+# ============================== v11: نژاد (انتخاب برای قدیمی‌ها و جدیدها) ==============================
+def race_card(key):
+    e, n, en, pro, con, _m = RACES[key]
+    return f"{e} {n} ({en})\n   ✅ {pro}\n   ⚠️ {con}"
+
+
+def race_list_text():
+    return "\n\n".join(race_card(k) for k in RACES)
+
+
+def race_pick_kb(uid):
+    return Markup([[Btn(f"{v[0]} {v[1]} ({v[2]})", f"race_view:{uid}:{k}")] for k, v in RACES.items()])
+
+
+@command("نژاد", "race")
+async def cmd_race(update, ctx, args):
+    u = get_user(update.effective_user)
+    if u["race"] in RACES:
+        text = (f"🧬 نژاد تو:\n{race_card(u['race'])}\n\n━━━━━━━━━━━━━━\nهمه‌ی نژادها:\n\n{race_list_text()}\n\n"
+                "نژاد یک‌بار انتخاب می‌شه و دائمیه.")
+        return await update.message.reply_text(text)
+    text = ("🧬 هنوز نژادت رو انتخاب نکردی!\nهر نژاد مزیت و محدودیت مخصوص خودش رو داره.\n"
+            "انتخاب دائمیه؛ با دقت انتخاب کن:\n\n" + race_list_text())
+    await update.message.reply_text(text, reply_markup=race_pick_kb(u["id"]))
+
+
+async def cb_race(update, ctx):
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) != 3 or not parts[1].isdigit() or (parts[2] not in RACES and parts[2] != "menu"):
+        return await q.answer()
+    uid, key = int(parts[1]), parts[2]
+    if q.from_user.id != uid:
+        return await q.answer("این انتخاب مال تو نیست 😅", show_alert=True)
+    u = user_by_id(uid)
+    if not has_char(u):
+        return await q.answer()
+    if u["race"] in RACES:
+        return await q.answer("نژادت قبلاً انتخاب شده.", show_alert=True)
+    if parts[0] == "race_view":
+        await q.answer()
+        if key == "menu":
+            return await safe_edit(q, "🧬 نژادت رو انتخاب کن:\n\n" + race_list_text(), race_pick_kb(uid))
+        kb = Markup([[Btn("✅ تأیید نژاد", f"race_ok:{uid}:{key}"), Btn("↩️ برگشت", f"race_view:{uid}:menu")]])
+        return await safe_edit(q, f"🧬 {race_card(key)}\n\nمطمئنی؟ انتخاب نژاد دائمیه.", kb)
+    if key == "menu":
+        return await q.answer()
+    with tx():
+        cur = db.execute("UPDATE users SET race=? WHERE id=? AND race=''", (key, uid))
+    if not cur.rowcount:
+        return await q.answer("نژادت قبلاً انتخاب شده.", show_alert=True)
+    await q.answer("نژاد ثبت شد!")
+    await safe_edit(q, f"🎉 نژادت ثبت شد!\n\n{race_card(key)}\n\nجزئیات کامل توی «وضعیت قهرمان» و «راهنمای الدوریا».")
+
+
+@command("ریست نژاد", "resetrace", admin=True)
+async def cmd_reset_race(update, ctx, args):
+    msg = update.message
+    rt = msg.reply_to_message
+    target = rt.from_user.id if rt and rt.from_user else update.effective_user.id
+    with tx():
+        db.execute("UPDATE users SET race='' WHERE id=?", (target,))
+    await msg.reply_text("✅ نژاد این بازیکن ریست شد؛ می‌تونه دوباره با «نژاد» انتخاب کنه.")
+
+
+_race_nag = {}
+
+
+async def maybe_race_nudge(update, ctx):
+    """یادآوری ملایم (حداکثر هر ۶ ساعت) برای بازیکن‌های قدیمی که هنوز نژاد انتخاب نکردن."""
+    try:
+        uid = update.effective_user.id
+        u = user_by_id(uid)
+        if not has_char(u) or u["race"] in RACES:
+            return
+        last = _race_nag.get(uid)
+        if last is not None and time.time() - last < 6 * 3600:
+            return
+        _race_nag[uid] = time.time()
+        await update.message.reply_text("🧬 نژاد هنوز انتخاب نشده! هر نژاد مزیت مخصوص خودش رو داره.\nانتخاب کن:",
+                                        reply_markup=race_pick_kb(uid))
+    except Exception as e:
+        logging.warning("race nudge failed: %s", e)
+
+
+# ============================== v11: کد اختصاصی قهرمان ==============================
+def hero_by_code(text):
+    code = (text or "").translate(NORMALIZE).strip().upper()
+    if not code.startswith("EL-"):
+        code = "EL-" + code
+    return db.execute("SELECT * FROM users WHERE hero_code=? AND cls<>''", (code,)).fetchone()
+
+
+@command("کد قهرمان", "herocode", "جستجوی قهرمان", args=True)
+async def cmd_hero_code(update, ctx, args):
+    me = get_user(update.effective_user)
+    if not args:
+        code = ensure_hero_code(me["id"])
+        return await update.message.reply_text(
+            f"🆔 کد اختصاصی قهرمان تو: <code>{code}</code>\n"
+            "این کد به آیدی تلگرامت وابسته نیست. دوستانت می‌تونن با «کد قهرمان EL-XXXXXX» وضعیتت رو ببینن.",
+            parse_mode="HTML")
+    u = hero_by_code(args[0])
+    if not u:
+        return await update.message.reply_text("❌ قهرمانی با این کد پیدا نشد. کد مثل EL-AB12CD هست.")
+    text, kb = status_view(me["id"], u["id"], 1, ctx.bot.username)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ============================== v11: وضعیت قهرمان (دو صفحه) ==============================
+def _hero_rank(u, col):
+    assert col in ("xp", "fame")
+    return db.execute(f"SELECT COUNT(*)+1 FROM users WHERE cls<>'' AND ({col}>? OR ({col}=? AND id<?))",
+                      (u[col], u[col], u["id"])).fetchone()[0]
+
+
+def _bank_amount(uid):
+    r = db.execute("SELECT amount FROM bank WHERE user_id=?", (uid,)).fetchone()
+    return r["amount"] if r else 0
+
+
+def status_page1(u):
+    uid, lvl = u["id"], level_of(u["xp"])
+    code = ensure_hero_code(uid)
+    race = RACES.get(u["race"])
+    race_line = f"{race[0]} <b>{race[1]}</b> ({race[2]})" if race else "انتخاب نشده — بنویس «نژاد»"
+    if lvl >= LEVEL_CAP:
+        xp_line = f"✨ XP: {u['xp']:,}  •  <b>حداکثر لول</b> 👑"
+    else:
+        base, nxt = xp_for_level(lvl), xp_for_level(lvl + 1)
+        pct = max(0, min(100, int(100 * (u["xp"] - base) / max(1, nxt - base))))
+        xp_line = f"✨ تجربه: <b>{u['xp']:,} / {nxt:,}</b>\n{bar(u['xp'] - base, nxt - base)}  {pct}٪ تا لول بعدی"
+    ftitle, fnext = fame_title(u["fame"])
+    fame_lines = [f"🌠 شهرت دائمی: <b>{u['fame']:,}</b>  •  {html.escape(ftitle)}"]
+    if fnext:
+        fame_lines.append(f"{bar(u['fame'], fnext)}  {fnext - u['fame']:,} تا عنوان بعدی")
+    sn = season_now()["no"]
+    sp = sp_of(uid)
+    sr = sp_rank(uid)
+    bank = _bank_amount(uid)
+    return "\n".join([
+        "╔══════════════════════╗",
+        "       🌌 <b>ELDORIA</b> 🌌",
+        "       📜 <b>وضعیت قهرمان</b> — صفحه ۱ از ۲",
+        "╚══════════════════════╝",
+        f"👑 <b>{html.escape(u['name'])}</b>  {GENDERS.get(u['gender'], '❔')}",
+        f"🆔 کد قهرمان: <code>{code}</code>",
+        f"🧬 نژاد: {race_line}",
+        f"⚔️ کلاس: <b>{CLASSES[u['cls']][0]}</b>",
+        LINE,
+        f"⭐ سطح: <b>{lvl}/{LEVEL_CAP}</b>",
+        xp_line,
+        f"🏅 لقب: <b>{html.escape(title_of(lvl))}</b>",
+        LINE,
+        *fame_lines,
+        f"🌍 رتبه‌ی جهانی سطح: <b>#{_hero_rank(u, 'xp')}</b>  •  رتبه‌ی شهرت: <b>#{_hero_rank(u, 'fame')}</b>",
+        f"🌟 امتیاز فصل {sn}: <b>{sp:,}</b>  •  رتبه: {sr if sr else 'بدون رتبه'}",
+        LINE,
+        "💰 <b>ثروت و دارایی</b>",
+        f"🪙 سکه: <b>{u['coins']:,}</b>  •  🏦 بانک: {bank:,}",
+        f"💎 دارایی کل: <b>{u['coins'] + bank:,}</b>",
+        LINE,
+        "▶️ <i>برای تجهیزات، آمار و افتخارات، صفحه‌ی بعدی رو بزن.</i>",
+    ])
+
+
+def status_page2(u):
+    uid, lvl = u["id"], level_of(u["xp"])
+    eq = equipped_items(uid)
+    eq_lines = []
+    for sl in SLOTS:
+        key = eq.get(sl)
+        if key and key in ITEMS:
+            eq_lines.append(f"{SLOT_LABELS[sl]}: {html.escape(gear_name(uid, key))} {ITEM_RARITY.get(key, '')} "
+                            f"<i>(قدرت +{enhanced_power(uid, key)})</i>")
+        else:
+            eq_lines.append(f"{SLOT_LABELS[sl]}: —")
+    active = active_pet(uid)
+    if active and active["species"] in SPECIES:
+        pet_line = (f"{SPECIES[active['species']][0]} <b>{html.escape(active['name'])}</b>  •  لول {pet_level(active['xp'])}")
+    else:
+        pet_line = "ندارد"
+    g = guild_of(uid)
+    guild_line = "بدون انجمن"
+    if g:
+        guild_line = f"{html.escape(g['name'])}  •  {html.escape(g['role'])}"
+    sp = spouse_of(uid)
+    spouse_line = html.escape(sp[0]["name"]) if sp else "—"
+    games = u["duel_wins"] + u["duel_losses"]
+    rate = int(100 * u["duel_wins"] / games) if games else 0
+    zones = db.execute("SELECT COUNT(*) FROM zone_progress WHERE user_id=? AND clears>0", (uid,)).fetchone()[0]
+    best = f"{RARITY[u['loot_best']][0]} {RARITY[u['loot_best']][1]}" if u["loot_best"] else "—"
+    season_award = season_title(uid)
+    return "\n".join([
+        "╔══════════════════════╗",
+        "       🌌 <b>ELDORIA</b> 🌌",
+        "       📜 <b>وضعیت قهرمان</b> — صفحه ۲ از ۲",
+        "╚══════════════════════╝",
+        f"👑 <b>{html.escape(u['name'])}</b>  •  سطح {lvl}",
+        LINE,
+        "🎒 <b>تجهیزات فعال</b>",
+        *eq_lines,
+        f"⚡ قدرت رزمی: <b>{int(duel_power(u))}</b>",
+        LINE,
+        f"🐾 همراه: {pet_line}",
+        f"🏰 انجمن: {guild_line}",
+        f"💍 ازدواج: {spouse_line}",
+        LINE,
+        "⚔️ <b>آمار نبرد</b>",
+        f"🏆 دوئل: {u['duel_wins']} برد / {u['duel_losses']} باخت  •  نرخ پیروزی: {rate}٪",
+        f"🐉 غول‌های شکست‌داده‌شده: {u['boss_kills']}  •  🌍 غول‌های جهانی: {u['world_wins']}",
+        LINE,
+        "🗺 <b>ماجراجویی</b>",
+        f"🧭 سفرها: {u['adv_count']}  •  🔨 کارها: {u['work_count']}",
+        f"🗺 مناطق کامل‌شده: {zones}/{len(ZONES)}  •  👑 باس منطقه: {u['adv_boss_kills']}",
+        f"📦 صندوق‌های بازشده: {u['adv_chests']}  •  ✨ بهترین یافته: {best}",
+        LINE,
+        "🏆 <b>افتخارات</b>",
+        f"🎖 مدال‌ها: {ach_badges(uid)}",
+        f"🌠 شهرت: {u['fame']:,} ({html.escape(fame_title(u['fame'])[0])})",
+        *([f"👑 عنوان فصلی: {html.escape(season_award)}"] if season_award else []),
+        LINE,
+        "📖 <i>افسانه‌ات هنوز نوشته می‌شود؛ ماجراجویی ادامه دارد...</i>",
+    ])
+
+
+def status_text(u, page=1):
+    return status_page2(u) if page == 2 else status_page1(u)
+
+
+def profile_text(u):          # سازگاری با کدهای قدیمی
+    return status_page1(u)
+
+
+def status_view(viewer, target_id, page, bot_username):
+    u = user_by_id(target_id)
+    text = status_text(u, page)
+    if page == 1:
+        rows = [[Btn("صفحه‌ی بعدی ▶️", f"st:{viewer}:{target_id}:2")]]
+        if viewer == target_id and bot_username:
+            rows.append([Btn("📤 اشتراک‌گذاری کارت قهرمان",
+                             url=share_url(ref_link(bot_username, viewer), share_card_text(u)))])
+    else:
+        rows = [[Btn("◀️ بازگشت به صفحه‌ی اول", f"st:{viewer}:{target_id}:1")]]
+    return text, Markup(rows)
+
+
+@command("وضعیت قهرمان", "status", "پروفایل", "profile")
+async def cmd_status(update, ctx, args):
+    msg = update.message
+    rt = msg.reply_to_message
+    me = get_user(update.effective_user)
+    if rt and rt.from_user and not rt.from_user.is_bot and rt.from_user.id != me["id"]:
+        u = user_by_id(rt.from_user.id)
+        if not has_char(u):
+            return await msg.reply_text("این بازیکن هنوز قهرمانی نساخته.")
+    else:
+        u = me
+    await send_event_sticker(ctx, update.effective_chat.id, "profile", 0.6)
+    text, kb = status_view(me["id"], u["id"], 1, ctx.bot.username)
+    await msg.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def cb_status(update, ctx):
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts[1:]) or parts[3] not in ("1", "2"):
+        return await q.answer()
+    viewer, target, page = int(parts[1]), int(parts[2]), int(parts[3])
+    if q.from_user.id != viewer:
+        return await q.answer("این صفحه مال کس دیگه‌ایه؛ خودت «وضعیت قهرمان» رو بزن.", show_alert=True)
+    if not has_char(user_by_id(target)):
+        return await q.answer("این قهرمان دیگه در دسترس نیست.", show_alert=True)
+    text, kb = status_view(viewer, target, page, ctx.bot.username)
+    await q.answer()
+    await safe_edit(q, text, kb, parse_mode="HTML")
+
+
+# ============================== v11: رتبه‌بندی شهرت ==============================
+@command("برترین شهرت", "fame", "شهرت")
+async def cmd_fame_top(update, ctx, args):
+    u = get_user(update.effective_user)
+    rows = db.execute("SELECT * FROM users WHERE cls<>'' AND fame>0 ORDER BY fame DESC, id LIMIT 10").fetchall()
+    medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
+    lines = ["🌠 برترین‌های شهرت دائمی", "━━━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("هنوز کسی شهرتی نداره!")
+    for i, r in enumerate(rows):
+        lines.append(f"{medals[i]} {r['name']} — {r['fame']:,} ({fame_title(r['fame'])[0]})")
+    ft, fn = fame_title(u["fame"])
+    lines += ["", f"🙋 تو: {u['fame']:,} — {ft} (رتبه‌ی #{_hero_rank(u, 'fame')})",
+              "", "شهرت از غول‌کشی، ماجراجویی، باس منطقه، مدال‌ها، آهنگری سطح بالا و رتبه‌ی فصل میاد و هیچ‌وقت پاک نمی‌شه."]
+    await update.message.reply_text("\n".join(lines))
+
+
+# ============================== v11: راهنمای الدوریا ==============================
+GUIDE_TOPICS = [("classes", "⚔️ کلاس‌ها"), ("races", "🧬 نژادها"), ("level", "⭐ لول و XP"),
+                ("gear", "🎒 تجهیزات و آهنگری"), ("shop", "🛒 فروشگاه و کمیابی"), ("adv", "🗺 ماجراجویی"),
+                ("dungeon", "🕳 سرداب"), ("pets", "🐾 همراه‌ها"), ("guild", "🏰 انجمن و ازدواج"),
+                ("fame", "🌠 شهرت و فصل"), ("eco", "💰 اقتصاد"), ("fight", "👹 غول، دوئل، دزدی")]
+
+
+def guide_text(topic):
+    if topic == "classes":
+        body = "\n".join(f"{v[0]}" for v in CLASSES.values())
+        return ("⚔️ کلاس‌ها\n━━━━━━━━━━━━━━\nکلاس موقع ساخت قهرمان انتخاب می‌شه و تجهیزات و مزیت‌های مخصوص خودش رو داره:\n\n" + body
+                + "\n\n🗡 سلاح‌های شمشیری عمومی فقط برای جنگجو و نینجاست؛ هر کلاس سلاح اختصاصی خودش رو توی فروشگاه داره.")
+    if topic == "races":
+        return ("🧬 نژادها\n━━━━━━━━━━━━━━\n" + race_list_text() +
+                "\n\nنژاد یک‌بار انتخاب می‌شه (بازیکن‌های قدیمی با «نژاد» انتخاب می‌کنن) و روی XP، کار، ماجراجویی، نبرد و دزدی اثر می‌ذاره.")
+    if topic == "level":
+        return (f"⭐ لول و XP\n━━━━━━━━━━━━━━\nحداکثر لول {LEVEL_CAP} هست. XP از کار، ماجراجویی، سرداب، غول‌ها، مأموریت‌ها و مدال‌ها میاد.\n"
+                "هر لول قابلیت‌های جدیدی باز می‌کنه و لقب قهرمانت رو عوض می‌کنه. با «وضعیت قهرمان» نوار پیشرفت XP رو ببین.\n"
+                "🧬 نژاد انسان +۸٪ XP می‌ده و الف تاریک −۸٪.")
+    if topic == "gear":
+        return ("🎒 تجهیزات و آهنگری\n━━━━━━━━━━━━━━\n۴ جایگاه داری: 🛠 ابزار (سکه‌ی کار)، ⚔️ سلاح (شانس پیروزی)، 🛡 زره (کاهش خسارت)، 🔮 طلسم (جایزه بیشتر).\n"
+                "بهترین وسیله‌ی هر جایگاه خودکار فعال می‌شه. با «آهنگری» وسیله‌ت رو تا +۱۰ ارتقا بده (ریسک شکست داره).\n"
+                "فروش وسیله نصف قیمته؛ ولی وسیله‌هایی که از غنیمت پیدا کردی فقط ۲٪ قیمت می‌ارزن (برای حفظ تعادل اقتصاد).")
+    if topic == "shop":
+        rar = "  ".join(f"{v[0]} {v[1]}" for v in RARITY.values())
+        return ("🛒 فروشگاه و کمیابی\n━━━━━━━━━━━━━━\nفروشگاه به دسته‌ها تقسیم شده؛ برای هر وسیله قیمت، قدرت، ویژگی و لول موردنیاز رو می‌بینی.\n"
+                f"🔒 وسیله‌های قفل‌شده شرط بازشدنشون رو نشون می‌دن.\n\nدرجه‌های کمیابی:\n{rar}\n\n"
+                "درجه‌ی بالاتر یعنی قوی‌تر و گران‌تر. وسیله‌های Epic و Legendary معمولاً از لول‌های بالا باز می‌شن؛ بعضی غنیمت‌ها فقط از ماجراجویی/سرداب میان.")
+    if topic == "adv":
+        zl = "\n".join(f"{z['emoji']} {z['name']} — لول {z['lvl']}+" for z in ZONES)
+        return ("🗺 ماجراجویی\n━━━━━━━━━━━━━━\nماجراجویی اکتشاف و غنیمت‌گیریه (کار = درآمد معمولی؛ سرداب = نبرد سخت مرحله‌ای).\n"
+                "هر سفر: ۳ برخورد + مرحله‌ی نهایی (باس منطقه یا گنجینه). قبل از هر برخورد یکی از سه مسیر رو انتخاب می‌کنی:\n"
+                "🌲 امن (کم‌ریسک) • ⛰ پرخطر (غنیمت و شانس کمیاب بیشتر) • 🌫 ناشناخته (غافلگیری!)\n"
+                "برخوردها: دشمن (نبرد/دزدکی/فرار)، رویدادهای تصادفی با انتخاب، و صندوق گنج. دشمن نخبه (⭐) قوی‌تر ولی ارزشمندتره.\n"
+                "جان محدوده؛ معجون خودکار نجاتت می‌ده و هر لحظه می‌تونی با غنیمتت برگردی. اگه بمیری غنیمت سفر از دست می‌ره.\n\n"
+                f"مناطق:\n{zl}\n\nمنطقه‌های بالاتر دشمن قوی‌تر و غنیمت ارزشمندتر دارن؛ باس هر منطقه یه غنیمت ویژه می‌ده. «اکتشاف» پاداش‌های یک‌باره رو نشون می‌ده.")
+    if topic == "dungeon":
+        return ("🕳 سرداب\n━━━━━━━━━━━━━━\nنبرد ۳مرحله‌ای (مرحله‌ی آخر باسه). یا می‌جنگی (ریسک و پاداش بالا) یا دزدکی رد می‌شی.\n"
+                "دشمن‌ها و خسارتشون با لول قهرمان بزرگ می‌شن. معجون جونت رو نجات می‌ده. اگه بمیری غنیمت از دست می‌ره؛\n"
+                "اگه زنده بیرون بیای سکه، XP، شهرت و غنیمت‌های Rare/Epic (و گاهی غنیمت ویژه‌ی سرداب) می‌گیری. هر ساعت یک‌بار.")
+    if topic == "pets":
+        return ("🐾 همراه‌ها\n━━━━━━━━━━━━━━\nاز تخم‌ها همراه به دنیا میاد (تخم از فروشگاه یا رویدادها). همراه رو غذا بده تا رشد کنه؛ هر همراه بونوس مخصوص داره "
+                "(XP، سکه، شانس، دفاع...). همراه می‌تونه به سفر بره و غنیمت بیاره. «همراه» و «تخم‌ها» رو ببین.")
+    if topic == "guild":
+        return ("🏰 انجمن و ازدواج\n━━━━━━━━━━━━━━\nانجمن بساز یا عضو شو تا بونوس سکه‌ی کار بگیری و با هم غول بزنید.\n"
+                f"💍 ازدواج بونوس +{MARRY_BONUS}٪ سکه‌ی کار می‌ده (با «ازدواج» روی پیام طرف ریپلای کن).\n"
+                "دوست‌ها با «دوست» اضافه می‌شن و می‌تونن همدیگه رو ببینن.")
+    if topic == "fame":
+        tl = " ← ".join(f"{n} ({t})" for t, n in FAME_TITLES)
+        return ("🌠 شهرت و فصل\n━━━━━━━━━━━━━━\n🌠 شهرت دائمی هیچ‌وقت پاک نمی‌شه و با کارهای ارزشمند زیاد می‌شه: غول‌کشی، باس منطقه، "
+                "اکتشاف کامل، سرداب، مدال، آهنگری +۵/+۱۰، دعوت دوستان و رتبه‌ی فصل.\n"
+                f"عنوان‌ها: {tl}\n\n🌟 امتیاز فصل جداست و هر فصل ریست می‌شه؛ برندگان فصل جایزه می‌گیرن. رتبه‌ها: «برترین شهرت» و «فصل».")
+    if topic == "eco":
+        return ("💰 اقتصاد\n━━━━━━━━━━━━━━\n«کار» هر چند دقیقه سکه می‌ده. «بانک» سکه‌ت رو امن نگه می‌داره و سود می‌ده. "
+                "«بازار» برای خرید و فروش وسیله بین بازیکن‌هاست (کارمزد دارد). «انتقال» برای فرستادن سکه (سقف روزانه داره). "
+                "«جایزه» روزانه، «مأموریت» و «چرخ شانس» هم درآمد جانبی‌ان.")
+    return ("👹 غول، دوئل، دزدی\n━━━━━━━━━━━━━━\nغول گروه و غول جهانی رو با «ضربه» بزن؛ هر چی لول و سلاحت بهتر، آسیبت بیشتر. "
+            "«دوئل» شرط‌بندی ۱ به ۱ با دوستانه، «دزدی» ریسک داره (قفل و زره دفاع می‌کنه). با «غول» وضعیت رو ببین.")
+
+
+def guide_menu_kb(uid):
+    rows, row = [], []
+    for k, label in GUIDE_TOPICS:
+        row.append(Btn(label, f"gd:{uid}:{k}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return Markup(rows)
+
+
+GUIDE_INTRO = ("📖 راهنمای الدوریا\n━━━━━━━━━━━━━━\nدانشنامه‌ی کامل بازی. یه موضوع رو انتخاب کن:\n"
+               "(برای آموزش قدم‌به‌قدم و جایزه‌هاش «آموزش» رو بزن.)")
+
+
+@command("راهنمای الدوریا", "guide", "الدوریا", "دانشنامه")
+async def cmd_guide(update, ctx, args):
+    await update.message.reply_text(GUIDE_INTRO, reply_markup=guide_menu_kb(update.effective_user.id))
+
+
+async def cb_guide(update, ctx):
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) != 3 or not parts[1].isdigit():
+        return await q.answer()
+    uid = int(parts[1])
+    if q.from_user.id != uid:
+        return await q.answer("این راهنما رو خودت باز کن: «راهنمای الدوریا»", show_alert=True)
+    await q.answer()
+    if parts[2] == "menu":
+        return await safe_edit(q, GUIDE_INTRO, guide_menu_kb(uid))
+    if parts[2] not in dict(GUIDE_TOPICS):
+        return
+    kb = Markup([[Btn("📖 فهرست راهنما", f"gd:{uid}:menu")]])
+    await safe_edit(q, guide_text(parts[2]), kb)
+
+
 # ============================== اجرا ==============================
 CALLBACKS = {
     "shop": cb_shop, "buy": cb_buy, "equip": cb_inventory, "sell": cb_inventory,
@@ -5402,6 +6905,7 @@ CALLBACKS = {
     "pet_list": cb_pet, "pet_set": cb_pet, "pet_rel": cb_pet, "pet_relyes": cb_pet, "pet_eggs": cb_pet,
     "egg_start": cb_pet, "egg_hatch": cb_pet, "world_hit": cb_world,
     "tut_claim": cb_tut, "chest_open": cb_chest,
+    "st": cb_status, "gd": cb_guide, "race_view": cb_race, "race_ok": cb_race, "ad": cb_adventure,
 }
 
 
