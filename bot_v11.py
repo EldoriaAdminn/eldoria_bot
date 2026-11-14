@@ -426,6 +426,89 @@ NORMALIZE = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩يك",
 NAME_RE = re.compile(r"[\w\u200c ]{2,16}")
 GUILD_NAME_RE = re.compile(r"[\w\u200c ]{3,24}")
 
+# ============================== بکاپ تلگرامی و بازیابی خودکار ==============================
+# روی هاست‌هایی که دیسک موقت دارن (ری‌استارت = پاک‌شدن فایل‌ها) دیتابیس از روی آخرین بکاپ پین‌شده‌ی
+# چت ادمین خودکار برمی‌گرده. راه‌حل اصلی همچنان دیسک دائمی (Volume) و تنظیم DB_PATH هست.
+TG_API_BASE = os.getenv("TG_API_BASE", "https://api.telegram.org")
+BACKUP_PREFIX = "eldoria_backup_"
+_RESTORED_AT_BOOT = None
+
+
+def _tg_http(url, data=None, timeout=60):
+    import urllib.parse
+    import urllib.request
+    handlers = []
+    if PROXY_URL:
+        handlers.append(urllib.request.ProxyHandler({"https": PROXY_URL, "http": PROXY_URL}))
+    opener = urllib.request.build_opener(*handlers)
+    body = urllib.parse.urlencode(data).encode() if data else None
+    with opener.open(urllib.request.Request(url, data=body), timeout=timeout) as r:
+        return r.read()
+
+
+def backup_chat_id():
+    v = os.getenv("BACKUP_CHAT_ID", "").strip()
+    if v.lstrip("-").isdigit():
+        return int(v)
+    return min(ADMIN_IDS) if ADMIN_IDS else None
+
+
+def unpack_backup(raw):
+    import gzip
+    return gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
+
+
+def validate_db_file(path):
+    """(سالم؟، تعداد قهرمان‌ها) — فایل بکاپ قبل از جایگزینی حتماً بررسی می‌شه."""
+    try:
+        c = sqlite3.connect(path)
+        try:
+            ok = c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            n = c.execute("SELECT COUNT(*) FROM users WHERE cls<>''").fetchone()[0]
+        finally:
+            c.close()
+        return ok, n
+    except Exception:
+        return False, 0
+
+
+def try_auto_restore():
+    """اگه فایل دیتابیس وجود نداره (دیسک پاک شده)، آخرین بکاپ پین‌شده‌ی چت ادمین رو برمی‌گردونه."""
+    global _RESTORED_AT_BOOT
+    if DB_PATH == ":memory:" or (os.path.isfile(DB_PATH) and os.path.getsize(DB_PATH) > 0):
+        return False
+    chat = backup_chat_id()
+    if not TOKEN or not chat:
+        return False
+    try:
+        info = json.loads(_tg_http(f"{TG_API_BASE}/bot{TOKEN}/getChat", {"chat_id": chat}))
+        doc = ((info.get("result") or {}).get("pinned_message") or {}).get("document") or {}
+        if not doc.get("file_id") or not str(doc.get("file_name", "")).startswith(BACKUP_PREFIX):
+            logging.warning("بازیابی خودکار: بکاپ پین‌شده‌ای توی چت ادمین پیدا نشد.")
+            return False
+        f = json.loads(_tg_http(f"{TG_API_BASE}/bot{TOKEN}/getFile", {"file_id": doc["file_id"]}))
+        raw = _tg_http(f"{TG_API_BASE}/file/bot{TOKEN}/{f['result']['file_path']}", timeout=180)
+        folder = os.path.dirname(os.path.abspath(DB_PATH))
+        os.makedirs(folder, exist_ok=True)
+        tmp = DB_PATH + ".restore.tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(unpack_backup(raw))
+        ok, n = validate_db_file(tmp)
+        if not ok or n < 1:
+            os.remove(tmp)
+            logging.error("بازیابی خودکار: فایل بکاپ معتبر نبود؛ دست‌نخورده رد شد.")
+            return False
+        os.replace(tmp, DB_PATH)
+        _RESTORED_AT_BOOT = (doc.get("file_name"), n)
+        logging.warning("دیتابیس از بکاپ پین‌شده‌ی تلگرام بازیابی شد: %s (%d قهرمان)", doc.get("file_name"), n)
+        return True
+    except Exception:
+        logging.exception("بازیابی خودکار ناموفق بود")
+        return False
+
+
+try_auto_restore()
+
 # ============================== دیتابیس ==============================
 db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)  # autocommit
 db.row_factory = sqlite3.Row
@@ -1169,7 +1252,7 @@ def flooding(uid):
     t = time.monotonic()
     if len(_last_cmd) > 5000:
         _last_cmd.clear()
-    if t - _last_cmd.get(uid, 0) < FLOOD_GAP:
+    if t - _last_cmd.get(uid, -1e9) < FLOOD_GAP:
         return True
     _last_cmd[uid] = t
     return False
@@ -1177,7 +1260,7 @@ def flooding(uid):
 
 async def nag_create(update, ctx, force=False):
     uid, t = update.effective_user.id, time.monotonic()
-    if not force and t - _nag.get(uid, 0) < 60:
+    if not force and t - _nag.get(uid, -1e9) < 60:
         return
     if len(_nag) > 5000:
         _nag.clear()
@@ -4683,16 +4766,141 @@ async def setup_bot_profile(bot):
 async def _backup_job(context):
     # SQLite backup is synchronous and short for this bot's local database.
     backup_db()
+    await send_backup(context.bot)
+
+
+async def _post_stop(app):
+    """موقع خاموش‌شدن مرتب (مثلاً ری‌استارت هاست) آخرین وضعیت بازی رو هم می‌فرسته."""
+    backup_db()
+    await send_backup(app.bot, reason="قبل از خاموشی")
 
 
 async def _post_init(app):
     await setup_bot_profile(app.bot)
+    if _RESTORED_AT_BOOT and backup_chat_id():
+        try:
+            await app.bot.send_message(backup_chat_id(), f"♻️ ربات ری‌استارت شد و دیتابیس از بکاپ «{_RESTORED_AT_BOOT[0]}» "
+                                                         f"بازیابی شد ({_RESTORED_AT_BOOT[1]} قهرمان).")
+        except Exception:
+            pass
     if app.job_queue is not None:
-        app.job_queue.run_repeating(_backup_job, interval=6 * 3600, first=6 * 3600,
+        app.job_queue.run_repeating(_backup_job, interval=BACKUP_INTERVAL_MIN * 60, first=90,
                                    name="database_backup")
     else:
         logging.warning("JobQueue unavailable; only startup database backup is enabled. "
                         "Install python-telegram-bot[job-queue] for periodic backups.")
+
+
+# ============================== بکاپ تلگرامی (ارسال، دستور، بازیابی دستی) ==============================
+BACKUP_INTERVAL_MIN = max(10, int(os.getenv("BACKUP_INTERVAL_MIN", "60") or 60))
+_last_backup_hash = None
+
+
+def make_backup_blob():
+    """بکاپ سازگار با WAL، فشرده‌شده. خروجی: (bytes فشرده، sha1 فایل خام، تعداد قهرمان)."""
+    import gzip
+    import hashlib
+    tmp = DB_PATH + ".send.tmp"
+    dst = sqlite3.connect(tmp)
+    try:
+        with dst:
+            db.backup(dst)
+    finally:
+        dst.close()
+    try:
+        ok, n = validate_db_file(tmp)
+        if not ok:
+            raise RuntimeError("backup integrity check failed")
+        with open(tmp, "rb") as fh:
+            raw = fh.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return gzip.compress(raw, mtime=0), hashlib.sha1(raw).hexdigest(), n
+
+
+async def send_backup(bot, force=False, reason="خودکار"):
+    """بکاپ فشرده رو برای ادمین می‌فرسته و پین می‌کنه. دیتابیس خالی هیچ‌وقت بکاپ پین‌شده رو خراب نمی‌کنه."""
+    global _last_backup_hash
+    chat = backup_chat_id()
+    if not chat:
+        logging.warning("بکاپ تلگرامی: ADMIN_IDS یا BACKUP_CHAT_ID تنظیم نشده.")
+        return False
+    try:
+        blob, digest, n = make_backup_blob()
+        if n < 1:
+            return False
+        if digest == _last_backup_hash and not force:
+            return True
+        name = f"{BACKUP_PREFIX}{time.strftime('%Y%m%d_%H%M', time.gmtime())}.db.gz"
+        msg = await bot.send_document(chat, document=blob, filename=name,
+                                      caption=f"💾 بکاپ دیتابیس ({reason})\n👥 {n} قهرمان • {len(blob) // 1024} KB\n"
+                                              "این پیام پین می‌شه؛ ربات بعد از ری‌استارت ازش خودکار بازیابی می‌کنه.")
+        _last_backup_hash = digest
+        try:
+            await bot.unpin_all_chat_messages(chat)
+        except Exception:
+            pass
+        try:
+            await bot.pin_chat_message(chat, msg.message_id, disable_notification=True)
+        except Exception as e:
+            logging.warning("پین‌کردن بکاپ ناموفق بود (بازیابی خودکار کار نمی‌کنه): %s", e)
+            return False
+        return True
+    except Exception:
+        logging.exception("ارسال بکاپ تلگرامی ناموفق بود")
+        return False
+
+
+@command("بکاپ", "backup", admin=True)
+async def cmd_backup(update, ctx, args):
+    backup_db()
+    ok = await send_backup(ctx.bot, force=True, reason="دستی")
+    if not ok:
+        return await update.message.reply_text("⚠️ ارسال بکاپ ناموفق بود. توی PV ربات یه‌بار /start بزن و لاگ رو چک کن.")
+    if update.effective_chat.id != backup_chat_id():
+        await update.message.reply_text("✅ بکاپ به چت ادمین فرستاده و پین شد.")
+
+
+async def restore_handler(update, ctx):
+    """ادمین فایل بکاپ (.db یا .db.gz) رو با کپشن «بازیابی» می‌فرسته؛ دیتابیس جایگزین و ربات ری‌استارت می‌شه."""
+    msg, user = update.message, update.effective_user
+    if not msg or not msg.document or not user or not is_admin(user.id):
+        return
+    if not any(w in (msg.caption or "") for w in ("بازیابی", "restore", "Restore")):
+        return
+    try:
+        f = await ctx.bot.get_file(msg.document.file_id)
+        tmp = DB_PATH + ".upload.tmp"
+        await f.download_to_drive(tmp)
+        with open(tmp, "rb") as fh:
+            raw = unpack_backup(fh.read())
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        ok, n = validate_db_file(tmp)
+        if not ok or n < 1:
+            os.remove(tmp)
+            return await msg.reply_text("❌ فایل معتبر نیست (سالم نبود یا قهرمانی توش نیست). هیچ تغییری اعمال نشد.")
+        backup_db()                                   # نسخه‌ی فعلی قبل از جایگزینی نگه‌داشته می‌شه
+        try:
+            os.replace(DB_PATH + ".bak", DB_PATH + ".before_restore.bak")
+        except OSError:
+            pass
+        db.close()
+        for ext in ("-wal", "-shm"):
+            try:
+                os.remove(DB_PATH + ext)
+            except OSError:
+                pass
+        os.replace(tmp, DB_PATH)
+        await msg.reply_text(f"✅ دیتابیس بازیابی شد ({n} قهرمان). ربات در حال راه‌اندازی مجدد است...")
+        import sys
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception:
+        logging.exception("restore failed")
+        await msg.reply_text("❌ بازیابی ناموفق بود؛ لاگ رو چک کن. (نکته: ربات‌ها فقط فایل تا ۲۰ مگابایت رو می‌تونن دانلود کنن)")
 
 
 # ============================== مدال‌ها 🏅 ==============================
@@ -6920,7 +7128,11 @@ def main():
                .get_updates_pool_timeout(30))
     if PROXY_URL:
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
-    app = builder.post_init(_post_init).build()
+    builder = builder.post_init(_post_init)
+    if hasattr(builder, "post_stop"):
+        builder = builder.post_stop(_post_stop)
+    app = builder.build()
+    app.add_handler(MessageHandler(filters.Document.ALL, restore_handler))
     app.add_handler(MessageHandler(filters.TEXT, router))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(ChatMemberHandler(on_bot_added, ChatMemberHandler.MY_CHAT_MEMBER))
