@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ELDORIA: RISE OF KINGDOMS – نسخه‌ی توسعه‌یافته (v12.0)
+ELDORIA: RISE OF KINGDOMS – نسخه‌ی توسعه‌یافته (v13.0 — THE ABYSS / CREATURE ART)
 
 متغیرهای محیطی:
   BOT_TOKEN        توکن ربات (اجباری)
@@ -702,6 +702,43 @@ CREATE TABLE IF NOT EXISTS cosmetics(
 # مهاجرت کول‌داون قدیمی: آخرین زمان پوینت هر بازیکن از تمام گروه‌ها حفظ می‌شود.
 db.execute("INSERT OR IGNORE INTO global_point_cooldown(user_id,ts) SELECT user_id,MAX(ts) FROM last_point GROUP BY user_id")
 
+# ---------- ELDORIA: THE ABYSS — schema افزایشی و سازگار با دیتابیس قبلی ----------
+db.executescript("""
+CREATE TABLE IF NOT EXISTS abyss_players(
+    user_id INTEGER PRIMARY KEY, floor INTEGER NOT NULL DEFAULT 1, progress INTEGER NOT NULL DEFAULT 0,
+    energy INTEGER NOT NULL DEFAULT 8, energy_ts REAL NOT NULL DEFAULT 0,
+    pickaxe_tier INTEGER NOT NULL DEFAULT 1, durability INTEGER NOT NULL DEFAULT 30,
+    last_mine REAL NOT NULL DEFAULT 0, deepest INTEGER NOT NULL DEFAULT 1,
+    bosses_defeated INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS abyss_bag(
+    user_id INTEGER PRIMARY KEY, stone INTEGER NOT NULL DEFAULT 0, iron INTEGER NOT NULL DEFAULT 0,
+    crystal INTEGER NOT NULL DEFAULT 0, void_shard INTEGER NOT NULL DEFAULT 0, ancient_core INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS abyss_boss_state(
+    user_id INTEGER NOT NULL, floor INTEGER NOT NULL, hp INTEGER NOT NULL, max_hp INTEGER NOT NULL,
+    phase INTEGER NOT NULL DEFAULT 1, hits INTEGER NOT NULL DEFAULT 0,
+    created REAL NOT NULL, PRIMARY KEY(user_id, floor));
+CREATE TABLE IF NOT EXISTS global_artifacts(
+    artifact_key TEXT PRIMARY KEY, name TEXT NOT NULL, world_limit INTEGER NOT NULL, minted INTEGER NOT NULL DEFAULT 0,
+    min_floor INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS artifact_owners(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, artifact_key TEXT NOT NULL, user_id INTEGER NOT NULL,
+    acquired REAL NOT NULL, floor INTEGER NOT NULL, method TEXT NOT NULL DEFAULT 'abyss',
+    UNIQUE(artifact_key, user_id));
+CREATE INDEX IF NOT EXISTS idx_artifact_owners_user ON artifact_owners(user_id, id DESC);
+CREATE TABLE IF NOT EXISTS artifact_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, artifact_key TEXT NOT NULL, user_id INTEGER NOT NULL,
+    action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', ts REAL NOT NULL);
+""")
+for _key, _name, _limit, _floor in (
+    ("first_dragon_heart", "قلب اژدهای نخستین", 3, 30),
+    ("lost_crown", "تاج پادشاهی گمشده", 1, 50),
+    ("abyss_heart_diamond", "الماس قلب پرتگاه", 2, 40),
+    ("ancient_dragon_egg", "تخم اژدهای باستانی", 5, 35),
+    ("eternal_phoenix_feather", "پر ققنوس جاودان", 7, 25),
+):
+    db.execute("INSERT OR IGNORE INTO global_artifacts(artifact_key,name,world_limit,min_floor) VALUES(?,?,?,?)",
+               (_key, _name, _limit, _floor))
+
 
 def ensure_columns(table, cols):
     """ستون‌های جدید رو به دیتابیس قدیمی اضافه می‌کنه (اطلاعات قبلی پاک نمی‌شه)."""
@@ -733,6 +770,7 @@ ensure_columns("users", {
     "guide_seen": _INT0,
 })
 ensure_columns("guilds", {"wars_won": _INT0, "min_level": "INTEGER NOT NULL DEFAULT 1"})
+ensure_columns("abyss_boss_state", {"phase": "INTEGER NOT NULL DEFAULT 1", "hits": _INT0})
 # انجمن‌های قدیمی با حالت آزاد شروع می‌شوند تا عضویت قبلی‌شان ناگهان مسدود نشود.
 ensure_columns("guilds", {"join_mode": "TEXT NOT NULL DEFAULT 'open'"})
 ensure_columns("guild_war_member", {"donated": _INT0})
@@ -1151,7 +1189,10 @@ def guild_bonus(uid):
 
 async def safe_edit(q, text, kb=None, parse_mode=None):
     try:
-        await q.edit_message_text(text, reply_markup=kb, parse_mode=parse_mode)
+        if getattr(q.message, "photo", None):
+            await q.edit_message_caption(caption=text, reply_markup=kb, parse_mode=parse_mode)
+        else:
+            await q.edit_message_text(text, reply_markup=kb, parse_mode=parse_mode)
     except Exception as e:
         if "not modified" not in str(e):
             logging.warning("safe_edit failed: %s", e)
@@ -2771,7 +2812,8 @@ async def cmd_dungeon(update, ctx, args):
         db.execute("INSERT OR REPLACE INTO dungeon_runs(user_id, stage, hp, loot, ts) VALUES(?,1,?,0,?)",
                    (uid, hp, ts))
     text, kb = dungeon_view(uid, 1, hp, 0, ts)
-    await update.message.reply_text(text, reply_markup=kb)
+    _, enemy_name, _ = dungeon_enemy(uid, 1, ts)
+    await send_creature_photo(ctx, update.effective_chat.id, enemy_name, text, reply_markup=kb)
 
 
 def dungeon_step(uid, stage, choice):
@@ -2867,6 +2909,8 @@ async def cb_dungeon(update, ctx):
         return await send_event_sticker(ctx, q.message.chat_id, "win" if "🏆" in res["text"] else "lose", 1.0)
     text, kb = dungeon_view(uid, res["stage"], res["hp"], res["loot"], res["ts"])
     await safe_edit(q, f"{res['log']}\n\n{text}", kb)
+    _, enemy_name, _ = dungeon_enemy(uid, res["stage"], res["ts"])
+    await send_creature_photo(ctx, q.message.chat_id, enemy_name, text, reply_markup=kb)
 
 
 # ============================== دوستان ==============================
@@ -4292,8 +4336,8 @@ async def world_tick(ctx, chat_id):
             db.execute("UPDATE chats SET world_spawn_seen=? WHERE chat_id=?", (b["id"], chat_id))
             text, kb = world_card(b, chat_id)
             await send_event_sticker(ctx, chat_id, "world", 1.0)
-            await ctx.bot.send_message(chat_id, "🚨🌍 رویداد جهانی! یه غول عظیم‌الجثه به همه‌ی گروه‌ها حمله کرده!\n\n" + text,
-                                       reply_markup=kb)
+            await send_creature_photo(ctx, chat_id, b["name"], "🚨🌍 رویداد جهانی! یک غول عظیم‌الجثه به همه‌ی گروه‌ها حمله کرده!\n\n" + text,
+                                      reply_markup=kb)
         done = db.execute("SELECT * FROM world_boss WHERE status!='active' ORDER BY id DESC LIMIT 1").fetchone()
         if done and c["world_end_seen"] < done["id"]:
             db.execute("UPDATE chats SET world_end_seen=? WHERE chat_id=?", (done["id"], chat_id))
@@ -5535,6 +5579,40 @@ def chat_score(chat_id, pts):
     db.execute("UPDATE chats SET score=score+? WHERE chat_id=?", (pts, chat_id))
 
 
+# تصاویر اختصاصی غول‌ها؛ پوشه‌ی eldoria_assets باید کنار فایل اصلی ربات قرار بگیرد.
+ELDORIA_ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eldoria_assets")
+CREATURE_IMAGES = {
+    "سنگ‌خوار باستانی": "abyss_stone_eater.jpg", "پادشاه آهنین": "abyss_iron_king.jpg",
+    "سایه‌بلع": "abyss_shadow_devourer.jpg", "اژدهای تباهی": "abyss_ruin_dragon.jpg",
+    "امپراتور پرتگاه": "abyss_abyss_emperor.jpg", "اژدهای آتشین": "abyss_ruin_dragon.jpg",
+    "پادشاه مردگان": "giant_undead_knight.jpg", "دیو سیاه": "abyss_shadow_devourer.jpg",
+    "کراکن غول‌پیکر": "giant_ancient_spider.jpg", "غول کوهستان": "giant_magma_colossus.jpg",
+    "مار هزارسر": "giant_crystal_titan.jpg", "جادوگر تاریکی": "abyss_abyss_emperor.jpg",
+    "تایتان آتشین": "giant_magma_colossus.jpg", "اژدهای کهکشان": "abyss_ruin_dragon.jpg",
+    "دیو سیاره‌خوار": "giant_cavern_troll.jpg", "چشم ابدی": "abyss_stone_eater.jpg",
+    "ملکه‌ی عنکبوت‌ها": "giant_ancient_spider.jpg",
+    "اسکلت نگهبان": "giant_undead_knight.jpg", "عنکبوت غول‌پیکر": "giant_ancient_spider.jpg",
+    "گابلین قاتل": "giant_cavern_troll.jpg", "خفاش‌های وحشی": "abyss_shadow_devourer.jpg",
+    "غول مرده‌ی متحرک": "giant_magma_colossus.jpg", "روح سرگردان": "abyss_shadow_devourer.jpg",
+    "نگهبان سنگی": "abyss_stone_eater.jpg", "مار سیاه": "abyss_ruin_dragon.jpg",
+    "ارباب تاریکی": "abyss_abyss_emperor.jpg", "اژدهای زنجیری": "abyss_ruin_dragon.jpg",
+    "دیو سرداب": "abyss_iron_king.jpg",
+}
+
+
+async def send_creature_photo(ctx, chat_id, creature_name, caption, reply_markup=None, parse_mode=None):
+    filename = CREATURE_IMAGES.get(creature_name)
+    path = os.path.join(ELDORIA_ASSET_DIR, filename) if filename else ""
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "rb") as photo:
+                return await ctx.bot.send_photo(chat_id=chat_id, photo=photo, caption=caption,
+                                                reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception as exc:
+            logging.warning("Creature photo send failed (%s): %s", creature_name, exc)
+    return await ctx.bot.send_message(chat_id, caption, reply_markup=reply_markup, parse_mode=parse_mode)
+
+
 def boss_card(chat_id):
     b = db.execute("SELECT * FROM bosses WHERE chat_id=?", (chat_id,)).fetchone()
     if not b:
@@ -5567,7 +5645,7 @@ async def spawn_boss(ctx, chat_id, force=False):
     db.execute("DELETE FROM boss_damage WHERE chat_id=?", (chat_id,))
     text, kb = boss_card(chat_id)
     await send_event_sticker(ctx, chat_id, "boss", 1.0)
-    await ctx.bot.send_message(chat_id, "🚨 خطر! یه غول به گروه حمله کرد!\n\n" + text, reply_markup=kb)
+    await send_creature_photo(ctx, chat_id, name, "🚨 خطر! یک غول به گروه حمله کرده است!\n\n" + text, reply_markup=kb)
     return True
 
 
@@ -7673,6 +7751,10 @@ def status_page2(u):
     zones = db.execute("SELECT COUNT(*) FROM zone_progress WHERE user_id=? AND clears>0", (uid,)).fetchone()[0]
     best = f"{RARITY[u['loot_best']][0]} {RARITY[u['loot_best']][1]}" if u["loot_best"] else "—"
     season_award = season_title(uid)
+    abyss = db.execute("SELECT floor,deepest,bosses_defeated FROM abyss_players WHERE user_id=?", (uid,)).fetchone()
+    artifacts = db.execute("SELECT g.name FROM artifact_owners o JOIN global_artifacts g ON g.artifact_key=o.artifact_key WHERE o.user_id=? ORDER BY o.acquired", (uid,)).fetchall()
+    abyss_line = f"طبقه {abyss['floor']} / 50  •  رکورد {abyss['deepest']}" if abyss else "هنوز وارد پرتگاه نشده"
+    artifact_line = "، ".join(html.escape(r['name']) for r in artifacts) if artifacts else "هنوز اثری کشف نکرده‌ای"
     return "\n".join([
         "╔══════════════════════╗",
         "       🌌 <b>ELDORIA</b> 🌌",
@@ -7696,6 +7778,10 @@ def status_page2(u):
         f"🧭 سفرها: {u['adv_count']}  •  🔨 کارها: {u['work_count']}",
         f"🗺 مناطق کامل‌شده: {zones}/{len(ZONES)}  •  👑 باس منطقه: {u['adv_boss_kills']}",
         f"📦 صندوق‌های بازشده: {u['adv_chests']}  •  ✨ بهترین یافته: {best}",
+        LINE,
+        "🌌 <b>پرتگاه</b>",
+        f"🧭 پیشروی: {abyss_line}  •  👹 نگهبانان شکست‌خورده: {abyss['bosses_defeated'] if abyss else 0}/5",
+        f"🏛 آثار جاودان: {artifact_line}",
         LINE,
         "🏆 <b>افتخارات</b>",
         f"🎖 مدال‌ها: {ach_badges(uid)}",
@@ -8612,7 +8698,8 @@ GUIDE_TOPICS = [("classes", "⚔️ کلاس‌ها و مهارت"), ("races", "
                 ("gear", "🎒 تجهیزات و آهنگری"), ("shop", "🛒 فروشگاه و کمیابی"), ("adv", "🗺 ماجراجویی"),
                 ("dungeon", "🕳 سرداب"), ("pets", "🐾 همراه‌ها"), ("arena", "🏟 آرنا"),
                 ("guild", "🏰 انجمن و جنگ"), ("fame", "🌠 شهرت و فصل"), ("events", "🎪 رویدادها"),
-                ("vitrine", "🛍 ویترین"), ("eco", "💰 اقتصاد"), ("fight", "👹 غول، دوئل و دزدی")]
+                ("abyss", "🌌 پرتگاه و آثار جاودان"), ("vitrine", "🛍 ویترین"), ("eco", "💰 اقتصاد"),
+                ("fight", "👹 غول، دوئل و دزدی")]
 _GL = "━━━━━━━━━━━━━━"
 
 
@@ -8665,6 +8752,15 @@ def guide_text(topic):
                 "• دشمن‌ها و خسارتشون با لول و قدرت تو بزرگ می‌شن\n• معجون جونت رو نجات می‌ده\n"
                 "• اگه بمیری غنیمت از دست می‌ره\n• اگه زنده بیرون بیای: سکه، XP، شهرت و غنیمت Rare/Epic (و گاهی غنیمت ویژه‌ی سرداب)\n\n"
                 "⏳ هر ساعت یک‌بار • لول ۹+")
+    if topic == "abyss":
+        return (f"🌌 <b>ELDORIA: THE ABYSS — پرتگاه</b>\n{_GL}\nپرتگاه یک مسیر اکتشافی ۵۰ طبقه‌ای است؛ هرچه پایین‌تر بروی، منابع ارزشمندتر و نگهبانان مرگبارتر می‌شوند.\n\n"
+                "⛏ <b>استخراج:</b> هر بار یک واحد انرژی و یک واحد دوام کلنگ مصرف می‌کند. هر سه استخراج موفق، یک طبقه پیش می‌روی.\n"
+                "⚡ انرژی هر ۴۵ دقیقه یک واحد بازیابی می‌شود؛ کلنگ را با «تعمیر کلنگ» تعمیر کن.\n"
+                "👹 در طبقات ۱۰، ۲۰، ۳۰، ۴۰ و ۵۰ نگهبانان ویژه منتظرند؛ برای مبارزه «حمله پرتگاه» را بنویس.\n"
+                "🏛 <b>آثار جاودان:</b> پنج اثر با عرضه‌ی جهانی محدود وجود دارد. کشف آن‌ها به عمق زیاد و شانس بسیار پایین نیاز دارد؛ پس از تمام‌شدن نسخه‌ها، دیگر ساخته نمی‌شوند.\n\n"
+                "فرمان‌ها: «پرتگاه»، «استخراج»، «حمله پرتگاه»، «کیسه پرتگاه»، «ابزار پرتگاه»، «تعمیر کلنگ»، «اهدای پرتگاه»، «آثار جاودان» و «تاریخچه آثار».\n"
+                "برای کمک به شهر گروه، سنگ یا آهن را با «اهدای پرتگاه سنگ ۲۰» به خزانه منتقل کن.\n"
+                "<i>توجه: محدودیت جهانی آثار در محدوده‌ی همان دیتابیس مشترک بازی اعمال می‌شود.</i>")
     if topic == "pets":
         return (f"🐾 <b>همراه‌ها</b>\n{_GL}\nاز تخم‌ها همراه به دنیا میاد (از فروشگاه یا رویدادها). همراه رو غذا بده و باهاش بازی کن تا رشد کنه؛ "
                 "هر گونه بونوس مخصوص خودش رو داره (XP، سکه، شانس، دفاع...). همراه‌ها می‌تونن به سفر برن و غنیمت بیارن.\n\n"
@@ -8790,8 +8886,8 @@ async def cmd_help(update, ctx, args):
     await update.message.reply_text(
         f"⚔️ <b>الدوریا — میان‌بر دستورها</b>\n{_GL}\n"
         "🔥 <b>شروع قدرتمند</b>\nسرآغاز • کار • پوینت • جایزه\n\n"
-        "🗺 <b>ماجراجویی</b>\nماجراجویی • اکتشاف • سرداب • جاده\n\n"
-        "⚔️ <b>نبرد و رقابت</b>\nآرنا • دوئل • غول • حمله • جنگ انجمن\n\n"
+        "🗺 <b>ماجراجویی</b>\nماجراجویی • اکتشاف • سرداب • جاده • پرتگاه\n\n"
+        "⚔️ <b>نبرد و رقابت</b>\nآرنا • دوئل • غول • حمله • حمله پرتگاه • جنگ انجمن\n\n"
         "🛒 <b>رشد و ثروت</b>\nفروشگاه • کوله • آهنگری • بانک • بازار • ویترین\n\n"
         "🐾 <b>همراه و شانس</b>\nهمراه • تخم‌ها • چرخ • فال\n\n"
         "👤 <b>هویت</b>\nوضعیت قهرمان • نژاد • مهارت • کد قهرمان • تولد دوباره\n\n"
@@ -8912,6 +9008,351 @@ async def cb_players(update, ctx):
     text, page, pages = players_page(query, int(parts[2]))
     await q.answer()
     await safe_edit(q, text, players_kb(q.from_user.id, query, page, pages), parse_mode="HTML")
+
+
+# ============================== ELDORIA: THE ABYSS ==============================
+ABYSS_MAX_FLOOR = 50
+ABYSS_ENERGY_MAX = 8
+ABYSS_ENERGY_SECONDS = 45 * 60
+ABYSS_MINE_COOLDOWN = 45
+ABYSS_HIT_COOLDOWN = 60
+ABYSS_BOSSES = {
+    10: ("سنگ‌خوار باستانی", "🪨", 2200),
+    20: ("پادشاه آهنین", "⚙️", 6200),
+    30: ("سایه‌بلع", "🌑", 14500),
+    40: ("اژدهای تباهی", "🐉", 33000),
+    50: ("امپراتور پرتگاه", "👑", 85000),
+}
+ABYSS_FLOOR_NAMES = {
+    1: "دهانه‌ی خاموش", 5: "تالار ریشه‌های سنگی", 10: "قبرستان غول‌ها",
+    15: "شکاف آهنین", 20: "تختگاه فراموش‌شده", 25: "دریای کریستال‌ها",
+    30: "قلمرو سایه‌ها", 35: "دالان استخوانی", 40: "آشیانه‌ی تباهی",
+    45: "مرز جهان مردگان", 50: "تاجگاه ابدی",
+}
+ABYSS_ARTIFACT_LINES = [
+    "✨ برای یک لحظه، تمام صداهای پرتگاه خاموش شد... چیزی افسانه‌ای در دستانت می‌درخشید.",
+    "🌌 سنگ‌ها کنار رفتند و رازی کهن خودش را به تو سپرد؛ چنین کشفی شاید دیگر تکرار نشود.",
+    "👁️ حتی نگهبانان تاریکی هم عقب نشستند؛ تو چیزی پیدا کردی که نامش در افسانه‌هاست.",
+]
+
+
+def abyss_floor_name(floor):
+    keys = [k for k in ABYSS_FLOOR_NAMES if k <= floor]
+    return ABYSS_FLOOR_NAMES[max(keys)] if keys else "دهانه‌ی خاموش"
+
+
+def abyss_required_level(floor):
+    return min(30, 5 + max(0, floor - 1) // 2)
+
+
+def abyss_player(uid):
+    db.execute("INSERT OR IGNORE INTO abyss_players(user_id,energy_ts) VALUES(?,?)", (uid, time.time()))
+    db.execute("INSERT OR IGNORE INTO abyss_bag(user_id) VALUES(?)", (uid,))
+    row = db.execute("SELECT * FROM abyss_players WHERE user_id=?", (uid,)).fetchone()
+    now = time.time()
+    elapsed = max(0, now - (row["energy_ts"] or now))
+    gained = int(elapsed // ABYSS_ENERGY_SECONDS)
+    if gained:
+        energy = min(ABYSS_ENERGY_MAX, row["energy"] + gained)
+        new_ts = now if energy >= ABYSS_ENERGY_MAX else row["energy_ts"] + gained * ABYSS_ENERGY_SECONDS
+        db.execute("UPDATE abyss_players SET energy=?,energy_ts=? WHERE user_id=?", (energy, new_ts, uid))
+        row = db.execute("SELECT * FROM abyss_players WHERE user_id=?", (uid,)).fetchone()
+    return row
+
+
+def abyss_global_artifact(uid, floor):
+    """Attempt a globally capped mint inside the caller's BEGIN IMMEDIATE transaction."""
+    pool = db.execute("SELECT * FROM global_artifacts WHERE min_floor<=? AND minted<world_limit "
+                      "AND artifact_key NOT IN (SELECT artifact_key FROM artifact_owners WHERE user_id=?) "
+                      "ORDER BY min_floor", (floor,uid)).fetchall()
+    if not pool:
+        return None
+    # احتمال پایه عمداً بسیار پایین است؛ عمق بیشتر فقط اندکی شانس را بالا می‌برد.
+    chance = min(0.00022, 0.000012 + max(0, floor - 20) * 0.000004)
+    if random.random() >= chance:
+        return None
+    weights = [max(1, (r["min_floor"] - 10) ** 2) for r in pool]
+    chosen = random.choices(pool, weights=weights, k=1)[0]
+    changed = db.execute("UPDATE global_artifacts SET minted=minted+1 WHERE artifact_key=? AND minted<world_limit",
+                         (chosen["artifact_key"],)).rowcount
+    if not changed:
+        return None
+    now = time.time()
+    db.execute("INSERT INTO artifact_owners(artifact_key,user_id,acquired,floor) VALUES(?,?,?,?)",
+               (chosen["artifact_key"], uid, now, floor))
+    db.execute("INSERT INTO artifact_history(artifact_key,user_id,action,detail,ts) VALUES(?,?,?,?,?)",
+               (chosen["artifact_key"], uid, "discovered", f"کشف در طبقه {floor}", now))
+    return chosen["name"]
+
+
+def abyss_overview(uid):
+    a = abyss_player(uid)
+    u = user_by_id(uid)
+    lvl = level_of(u["xp"])
+    bag = db.execute("SELECT * FROM abyss_bag WHERE user_id=?", (uid,)).fetchone()
+    total_artifacts = db.execute("SELECT COUNT(*) FROM artifact_owners WHERE user_id=?", (uid,)).fetchone()[0]
+    lines = ["🌌 <b>ELDORIA: THE ABYSS</b>", "<i>هرچه عمیق‌تر بروی، بازگشت دشوارتر می‌شود...</i>",
+             "━━━━━━━━━━━━━━━━━━", f"📍 طبقه‌ی فعلی: <b>{a['floor']}</b> / {ABYSS_MAX_FLOOR} — {abyss_floor_name(a['floor'])}",
+             f"🏔 عمیق‌ترین رکورد: طبقه‌ی {a['deepest']}",
+             f"⚡ انرژی: {a['energy']}/{ABYSS_ENERGY_MAX}  |  ⛏ دوام کلنگ: {a['durability']}/30",
+             f"🧭 پیشروی این طبقه: {a['progress']}/3", f"🎒 آثار جاودان کشف‌شده: {total_artifacts}",
+             "━━━━━━━━━━━━━━━━━━", "🗝 هر سه استخراج موفق، تو را یک طبقه پایین‌تر می‌برد.",
+             f"🔒 حداقل لول ورود به طبقه‌ی فعلی: {abyss_required_level(a['floor'])} (لول تو: {lvl})"]
+    if a["floor"] == 50 and a["bosses_defeated"] >= 5:
+        lines += ["", "👑 <b>تو امپراتور پرتگاه را شکست داده‌ای!</b>", "نامت برای همیشه در تالار فاتحان پرتگاه ثبت شد."]
+    elif a["floor"] in ABYSS_BOSSES:
+        boss = ABYSS_BOSSES[a["floor"]]
+        state = db.execute("SELECT hp,max_hp FROM abyss_boss_state WHERE user_id=? AND floor=?", (uid,a["floor"])).fetchone()
+        if state:
+            lines += ["", f"⚠️ نگهبان این طبقه: {boss[1]} <b>{boss[0]}</b>", f"❤️ جان: {state['hp']:,}/{state['max_hp']:,}", "برای نبرد بنویس: حمله پرتگاه"]
+        else:
+            lines += ["", f"👁️ دروازه‌ی نگهبان {boss[0]} در این طبقه منتظر توست.", "برای آغاز نبرد بنویس: حمله پرتگاه"]
+    lines += ["", "<b>فرمان‌ها</b>", "• استخراج — جست‌وجوی منابع و رازها", "• حمله پرتگاه — نبرد با نگهبان طبقه",
+              "• کیسه پرتگاه — دیدن منابع", "• ابزار پرتگاه — وضعیت کلنگ", "• تعمیر کلنگ — تعمیر ابزار"]
+    return "\n".join(lines)
+
+
+@command("پرتگاه", "abyss")
+async def cmd_abyss(update, ctx, args):
+    u = get_user(update.effective_user)
+    a = abyss_player(u["id"])
+    await update.message.reply_text(abyss_overview(u["id"]), parse_mode="HTML")
+    if a["floor"] in ABYSS_BOSSES and not (a["floor"] == 50 and a["bosses_defeated"] >= 5):
+        boss_name = ABYSS_BOSSES[a["floor"]][0]
+        await send_creature_photo(ctx, update.effective_chat.id, boss_name,
+                                  f"👁️ <b>نگهبان طبقه‌ی {a['floor']}</b>\n{ABYSS_BOSSES[a['floor']][1]} {boss_name}\nبرای نبرد: «حمله پرتگاه»",
+                                  parse_mode="HTML")
+
+
+@command("استخراج", "mine abyss", level=5)
+async def cmd_abyss_mine(update, ctx, args):
+    uid = update.effective_user.id
+    u = get_user(update.effective_user)
+    now = time.time()
+    error = None
+    result = None
+    with tx():
+        a = abyss_player(uid)
+        lvl = level_of(u["xp"])
+        need = abyss_required_level(a["floor"])
+        if lvl < need:
+            error = f"🔒 این عمق هنوز برای تو زود است. لول موردنیاز: {need}؛ لول تو: {lvl}"
+        elif a["floor"] == 50 and a["bosses_defeated"] >= 5:
+            error = "👑 تو پرتگاه را فتح کرده‌ای؛ این پایان افسانه‌ی توست."
+        elif a["floor"] in ABYSS_BOSSES:
+            error = "👁️ راه پیشروی بسته است؛ ابتدا با نگهبان این طبقه روبه‌رو شو: «حمله پرتگاه»."
+        else:
+            left = max(0, ABYSS_MINE_COOLDOWN - (now - a["last_mine"]))
+            if left:
+                error = f"⏳ غبار هنوز فرو ننشسته؛ {fmt_time(left)} دیگر می‌توانی استخراج کنی."
+            elif a["energy"] <= 0:
+                error = "⚡ انرژی‌ات تمام شده. هر ۴۵ دقیقه یک واحد انرژی بازیابی می‌شود."
+            elif a["durability"] <= 0:
+                error = "⛏ کلنگت از کار افتاده؛ با دستور «تعمیر کلنگ» دوباره آماده‌اش کن."
+            else:
+                db.execute("UPDATE abyss_players SET energy=energy-1,durability=durability-1,last_mine=? WHERE user_id=?", (now,uid))
+                floor = a["floor"]
+                stone = random.randint(1, 2 + floor // 12)
+                iron = random.randint(0, 1 + floor // 18)
+                crystal = 1 if floor >= 12 and random.random() < min(.45, .04 + floor * .007) else 0
+                shard = 1 if floor >= 25 and random.random() < min(.22, .008 + floor * .003) else 0
+                core = 1 if floor >= 40 and random.random() < .012 else 0
+                db.execute("UPDATE abyss_bag SET stone=stone+?,iron=iron+?,crystal=crystal+?,void_shard=void_shard+?,ancient_core=ancient_core+? WHERE user_id=?",
+                           (stone,iron,crystal,shard,core,uid))
+                artifact = abyss_global_artifact(uid, floor) if floor >= 25 else None
+                progress = a["progress"] + 1
+                next_floor = floor
+                if progress >= 3:
+                    progress = 0
+                    if floor < ABYSS_MAX_FLOOR:
+                        next_floor = floor + 1
+                db.execute("UPDATE abyss_players SET floor=?,progress=?,deepest=MAX(deepest,?) WHERE user_id=?",
+                           (next_floor,progress,next_floor,uid))
+                grant_xp(uid, 2 + floor // 8)
+                result = (floor, stone, iron, crystal, shard, core, artifact, next_floor, a["energy"]-1, a["durability"]-1)
+    if error:
+        return await update.message.reply_text(error)
+    floor, stone, iron, crystal, shard, core, artifact, next_floor, energy, durability = result
+    lines = ["⛏ <b>ضربه‌ی کلنگ در دل تاریکی پیچید...</b>", f"📍 طبقه {floor} — {abyss_floor_name(floor)}",
+             f"🪨 سنگ: +{stone}  |  ⚙️ آهن: +{iron}"]
+    if crystal: lines.append(f"💎 کریستال کهن: +{crystal}")
+    if shard: lines.append(f"🌑 تکه‌ی سایه: +{shard}")
+    if core: lines.append(f"🔮 هسته‌ی باستانی: +{core}")
+    if random.random() < min(.28, .06 + floor * .004):
+        lines.append(random.choice(["🕯 صدایی از پشت دیوارها شنیدی؛ چیزی در این طبقه بیدار است...", "🦇 سایه‌ای از کنارت گذشت، اما چیزی برای تعقیب‌کردن پیدا نکردی.", "🧭 نشانه‌ای قدیمی روی دیوار پیدا کردی؛ مسیر پایین‌تر را بهتر می‌شناسی."]))
+    if artifact:
+        lines += ["", random.choice(ABYSS_ARTIFACT_LINES), f"🏆 <b>اثر جاودان: {artifact}</b>", "📜 نامت در دفتر کشفیات جاودان الدوریا ثبت شد!"]
+    if next_floor > floor:
+        lines += ["", f"⬇️ مسیر باز شد! به طبقه‌ی {next_floor} رسیدی: {abyss_floor_name(next_floor)}"]
+        if next_floor in ABYSS_BOSSES:
+            lines += ["", f"🚨 <b>نگهبان طبقه ظاهر شد: {ABYSS_BOSSES[next_floor][1]} {ABYSS_BOSSES[next_floor][0]}</b>", "برای آغاز نبرد بنویس: حمله پرتگاه"]
+    lines += ["", f"⚡ انرژی باقی‌مانده: {energy}/{ABYSS_ENERGY_MAX} | ⛏ دوام: {durability}/30"]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+@command("حمله پرتگاه", "abyss attack", level=5)
+async def cmd_abyss_attack(update, ctx, args):
+    uid = update.effective_user.id
+    u = get_user(update.effective_user)
+    now = time.time()
+    error = None
+    result = None
+    with tx():
+        a = abyss_player(uid)
+        floor = a["floor"]
+        if floor not in ABYSS_BOSSES:
+            error = "اینجا نگهبان طبقه‌ای وجود ندارد. به استخراج ادامه بده."
+        elif floor == 50 and a["bosses_defeated"] >= 5:
+            error = "👑 تو امپراتور پرتگاه را شکست داده‌ای؛ این افسانه دیگر تکرار نمی‌شود."
+        elif level_of(u["xp"]) < abyss_required_level(floor):
+            error = "قدرت کافی برای این نبرد را نداری."
+        else:
+            state = db.execute("SELECT * FROM abyss_boss_state WHERE user_id=? AND floor=?", (uid,floor)).fetchone()
+            name, emoji, base_hp = ABYSS_BOSSES[floor]
+            if not state:
+                max_hp = base_hp + floor * level_of(u["xp"]) * 45
+                db.execute("INSERT INTO abyss_boss_state(user_id,floor,hp,max_hp,created) VALUES(?,?,?,?,?)", (uid,floor,max_hp,max_hp,now))
+                state = db.execute("SELECT * FROM abyss_boss_state WHERE user_id=? AND floor=?", (uid,floor)).fetchone()
+            left = max(0, ABYSS_HIT_COOLDOWN - (now - a["last_mine"]))
+            if left:
+                error = f"⏳ برای جمع‌کردن نیرو {fmt_time(left)} صبر کن."
+            elif a["energy"] <= 0:
+                error = "⚡ انرژی کافی برای حمله نداری؛ کمی استراحت کن."
+            else:
+                weapon = best_power(uid, "weapon")
+                damage = random.randint(70,130) + level_of(u["xp"])*18 + weapon*8
+                critical = random.random() < .12
+                if critical: damage *= 2
+                hits = state["hits"] + 1
+                phase = state["phase"]
+                mechanic = ""
+                # هر نگهبان قانون نبرد مخصوص خودش را دارد؛ قدرتشان فقط به جان بیشتر محدود نیست.
+                if floor == 10 and phase == 1:
+                    damage = int(damage * .72)
+                    mechanic = "🪨 پوسته‌ی سنگی، بخشی از ضربه‌ات را دفع کرد."
+                elif floor == 20 and hits % 3 == 0:
+                    damage = int(damage * .55)
+                    mechanic = "🛡 سپر پادشاه آهنین فعال شد و ضربه را مهار کرد!"
+                elif floor == 40 and phase >= 2:
+                    damage = int(damage * .78)
+                    mechanic = "🔥 زره شعله‌ور اژدها، بخشی از آسیب را جذب کرد."
+                elif floor == 50 and phase == 2:
+                    damage = int(damage * .85)
+                    mechanic = "👑 امپراتور وارد فاز دوم شد؛ تاجش نیروی تو را پس می‌زند."
+                elif floor == 50 and phase >= 3:
+                    damage = int(damage * .68)
+                    mechanic = "🌌 فاز نهایی امپراتور؛ خود پرتگاه از او محافظت می‌کند."
+                hp = max(0, state["hp"] - damage)
+                if floor == 30 and hp > 0 and hits % 4 == 0:
+                    heal = max(1, int(state["max_hp"] * .06))
+                    hp = min(state["max_hp"], hp + heal)
+                    mechanic = f"🌑 سایه‌بلع از تاریکی نیرو گرفت و {heal:,} جان بازیابی کرد!"
+                next_phase = phase
+                if floor in (10, 40) and phase == 1 and hp <= state["max_hp"] * .5:
+                    next_phase = 2
+                    mechanic = "💥 فاز دوم! نگهبان پوسته/زره خود را شکست و خشمگین‌تر شد."
+                elif floor == 50 and phase == 1 and hp <= state["max_hp"] * .66:
+                    next_phase = 2
+                    mechanic = "👑 فاز دوم امپراتور آغاز شد؛ تاج باستانی بیدار شده است!"
+                elif floor == 50 and phase == 2 and hp <= state["max_hp"] * .33:
+                    next_phase = 3
+                    mechanic = "🌌 فاز نهایی! امپراتور با قلب پرتگاه یکی شد؛ آخرین ایستادگی را آغاز کن."
+                db.execute("UPDATE abyss_players SET energy=energy-1,last_mine=? WHERE user_id=?", (now,uid))
+                if hp:
+                    db.execute("UPDATE abyss_boss_state SET hp=?,phase=?,hits=? WHERE user_id=? AND floor=?", (hp,next_phase,hits,uid,floor))
+                else:
+                    db.execute("DELETE FROM abyss_boss_state WHERE user_id=? AND floor=?", (uid,floor))
+                    db.execute("UPDATE abyss_players SET floor=MIN(50,floor+1),deepest=MAX(deepest,MIN(50,floor+1)),progress=0,bosses_defeated=bosses_defeated+1 WHERE user_id=?", (uid,))
+                    db.execute("UPDATE abyss_bag SET ancient_core=ancient_core+? WHERE user_id=?", (1 if floor>=30 else 0,uid))
+                    add_coins(uid, floor*120)
+                    grant_xp(uid, floor*3)
+                result = (floor,name,emoji,damage,hp,state["max_hp"],a["energy"]-1,critical,mechanic,next_phase)
+    if error:
+        return await update.message.reply_text(error)
+    floor,name,emoji,damage,hp,max_hp,energy,critical,mechanic,phase = result
+    if hp:
+        await update.message.reply_text(f"⚔️ <b>{emoji} {name}</b> در برابر ضربه‌ات ایستاد!\n💥 آسیب تو: {damage:,}" + (" — ضربه‌ی بحرانی!" if critical else "") + (f"\n{mechanic}" if mechanic else "") + f"\n❤️ جان نگهبان: {hp:,}/{max_hp:,}\n🌀 فاز نبرد: {phase}\n⚡ انرژی باقی‌مانده: {energy}", parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"🏆 <b>{name} شکست خورد!</b>\n━━━━━━━━━━━━━━\n🌌 راه طبقه‌ی بعد گشوده شد.\n💰 پاداش: {floor*120:,} سکه\n✨ تجربه: +{floor*3} XP\n" + ("🔮 یک هسته‌ی باستانی نیز به دست آوردی!" if floor>=30 else ""), parse_mode="HTML")
+
+@command("کیسه پرتگاه", "abyss bag")
+async def cmd_abyss_bag(update, ctx, args):
+    uid = update.effective_user.id
+    abyss_player(uid)
+    b = db.execute("SELECT * FROM abyss_bag WHERE user_id=?", (uid,)).fetchone()
+    await update.message.reply_text("🎒 <b>کیسه‌ی اکتشافات پرتگاه</b>\n━━━━━━━━━━━━━━\n"
+        f"🪨 سنگ: {b['stone']:,}\n⚙️ آهن: {b['iron']:,}\n💎 کریستال کهن: {b['crystal']:,}\n"
+        f"🌑 تکه‌ی سایه: {b['void_shard']:,}\n🔮 هسته‌ی باستانی: {b['ancient_core']:,}", parse_mode="HTML")
+
+
+@command("اهدای پرتگاه", "abyss donate", args=True, level=5)
+async def cmd_abyss_donate(update, ctx, args):
+    uid, chat_id = update.effective_user.id, update.effective_chat.id
+    if city_level(chat_id) <= 0:
+        return await update.message.reply_text("🏰 این گروه هنوز شهری نساخته است؛ ابتدا شهر گروه را فعال کنید.")
+    if len(args) < 2 or args[0] not in ("سنگ", "آهن"):
+        return await update.message.reply_text("📦 روش استفاده: اهدای پرتگاه سنگ ۲۰\nیا: اهدای پرتگاه آهن همه")
+    resource = "stone" if args[0] == "سنگ" else "iron"
+    bag = db.execute("SELECT * FROM abyss_bag WHERE user_id=?", (uid,)).fetchone()
+    if not bag:
+        return await update.message.reply_text("🎒 هنوز چیزی از پرتگاه جمع نکرده‌ای؛ اول استخراج کن.")
+    amount = parse_amount(args[1], bag[resource])
+    if amount is None or amount <= 0:
+        return await update.message.reply_text("❌ مقدار باید یک عدد مثبت یا «همه» باشد.")
+    if amount > bag[resource]:
+        return await update.message.reply_text(f"🎒 فقط {bag[resource]:,} واحد {args[0]} در کیسه‌ات داری.")
+    with tx():
+        db.execute(f"UPDATE abyss_bag SET {resource}={resource}-? WHERE user_id=?", (amount,uid))
+        city_resources(chat_id)
+        db.execute(f"UPDATE city_resources SET {resource}={resource}+? WHERE chat_id=?", (amount,chat_id))
+        db.execute(f"INSERT INTO city_contributions(chat_id,user_id,{resource},updated) VALUES(?,?,?,?) "
+                   f"ON CONFLICT(chat_id,user_id) DO UPDATE SET {resource}={resource}+excluded.{resource},updated=excluded.updated",
+                   (chat_id,uid,amount,time.time()))
+        db.execute("INSERT INTO city_log(chat_id,user_id,action,detail,ts) VALUES(?,?,?,?,?)",
+                   (chat_id,uid,"اهدای پرتگاه",f"{amount} واحد {args[0]}",time.time()))
+    await update.message.reply_text(f"🏰 <b>هدیه‌ای از دل پرتگاه به شهر رسید!</b>\n{args[0]}: +{amount:,}\nاین منابع به خزانه‌ی شهر گروه اضافه شد.\n🌟 سپاس از سهم تو در آبادانی شهر.", parse_mode="HTML")
+
+
+@command("ابزار پرتگاه", "abyss tool")
+async def cmd_abyss_tool(update, ctx, args):
+    a = abyss_player(update.effective_user.id)
+    await update.message.reply_text(f"⛏ <b>کلنگ اکتشاف</b>\n━━━━━━━━━━━━━━\nدرجه: {a['pickaxe_tier']}\nدوام: {a['durability']}/30\n\nبا هر استخراج یک واحد از دوام کم می‌شود. تعمیر: «تعمیر کلنگ»", parse_mode="HTML")
+
+
+@command("تعمیر کلنگ", "repair pickaxe")
+async def cmd_abyss_repair(update, ctx, args):
+    uid = update.effective_user.id
+    a = abyss_player(uid)
+    if a["durability"] >= 30:
+        return await update.message.reply_text("⛏ کلنگت کاملاً سالم است؛ فعلاً نیازی به تعمیر ندارد.")
+    cost = (30-a["durability"]) * 35 + a["floor"] * 20
+    repaired = False
+    with tx():
+        if spend(uid, cost):
+            db.execute("UPDATE abyss_players SET durability=30 WHERE user_id=?", (uid,))
+            repaired = True
+    if not repaired:
+        return await update.message.reply_text(f"💰 برای تعمیر کامل کلنگ به {cost:,} سکه نیاز داری.")
+    await update.message.reply_text(f"🔧 آهنگر پرتگاه کلنگت را تعمیر کرد.\n⛏ دوام: 30/30\n💰 هزینه: {cost:,} سکه")
+
+
+@command("آثار جاودان", "global artifacts")
+async def cmd_artifacts(update, ctx, args):
+    rows = db.execute("SELECT g.*, (SELECT COUNT(*) FROM artifact_owners o WHERE o.artifact_key=g.artifact_key) AS held FROM global_artifacts g ORDER BY min_floor").fetchall()
+    lines = ["🏛 <b>تالار آثار جاودان الدوریا</b>", "<i>این آثار در سراسر جهان بازی تعداد محدودی دارند.</i>", "━━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        remaining = max(0, r["world_limit"]-r["minted"])
+        status = "تمام نسخه‌ها کشف شده" if remaining == 0 else f"{remaining} نسخه از {r['world_limit']} باقی مانده"
+        lines.append(f"✨ <b>{r['name']}</b>\n   🏆 {status} | از طبقه‌ی {r['min_floor']} به بعد")
+    lines += ["", "🔒 نسخه‌های کشف‌شده با معامله یا انتقال دوباره تولید نمی‌شوند."]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+@command("تاریخچه آثار", "artifact history")
+async def cmd_artifact_history(update, ctx, args):
+    rows = db.execute("SELECT h.*,g.name,u.name AS player FROM artifact_history h JOIN global_artifacts g ON g.artifact_key=h.artifact_key JOIN users u ON u.id=h.user_id ORDER BY h.id DESC LIMIT 10").fetchall()
+    lines = ["📜 <b>دفتر کشفیات جاودان</b>", "━━━━━━━━━━━━━━━━━━"]
+    lines += [f"{i}. ✨ {r['name']} — {html.escape(r['player'])}\n   طبقه {r['detail'].replace('کشف در طبقه ','')}" for i,r in enumerate(rows,1)]
+    await update.message.reply_text("\n".join(lines) if rows else "هنوز هیچ اثر جاودانی کشف نشده است.", parse_mode="HTML")
 
 
 # ============================== اجرا ==============================
